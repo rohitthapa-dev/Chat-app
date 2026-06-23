@@ -724,13 +724,21 @@ function EmptyState() {
   );
 }
 
+interface ChatDashboardProps {
+  currentUser?: string;
+  onLogout?: () => void;
+}
+
 // Main Dashboard
 
-export default function ChatDashboard() {
-  const { currentUser, users, messages, sendDM, fetchHistory, markRead } =
-    useSocket();
+export default function ChatDashboard({
+  currentUser: currentUserProp,
+  onLogout,
+}: ChatDashboardProps) {
+  const { users, messages, sendDM, fetchHistory, markRead } = useSocket();
   const [activeChat, setActiveChat] = useState<string | null>(null);
 
+  const currentUser = currentUserProp;
   if (!currentUser) return null;
 
   const handleSelectChat = (peerUsername: string) => {
@@ -780,6 +788,28 @@ export default function ChatDashboard() {
       ) : (
         <EmptyState />
       )}
+      {onLogout ? (
+        <button
+          onClick={onLogout}
+          style={{
+            position: "fixed",
+            top: 16,
+            right: 16,
+            zIndex: 10,
+            border: "none",
+            background: "#FFFFFF",
+            borderRadius: 999,
+            padding: "10px 14px",
+            boxShadow: "0 2px 10px rgba(0,0,0,0.08)",
+            cursor: "pointer",
+            fontSize: 13,
+            fontWeight: 600,
+            color: "#1A1A2E",
+          }}
+        >
+          Log out
+        </button>
+      ) : null}
     </div>
   );
 }

@@ -4,6 +4,7 @@ import {
   createContext,
   useContext,
   useEffect,
+  useRef,
   useState,
   useCallback,
   useMemo,
@@ -11,7 +12,7 @@ import {
 } from "react";
 import { io, type Socket } from "socket.io-client";
 
-// Types
+// ─── Types ────────────────────────────────────────────────────────────────────
 
 export interface PresenceUser {
   username: string;
@@ -39,26 +40,22 @@ interface ServerToClientEvents {
 }
 
 interface ClientToServerEvents {
-  REGISTER: (username: string) => void;
   SEND_DM: (payload: { recipientId: string; content: string }) => void;
   FETCH_HISTORY: (payload: { targetUsername: string; limit?: number }) => void;
   MARK_READ: (payload: { channelId: string }) => void;
 }
 
-//  Shared utility: deterministic channel ID
+// ─── Shared utility: deterministic channel ID ─────────────────────────────────
 
 export const getDMChannelId = (userA: string, userB: string): string =>
   [userA.toLowerCase(), userB.toLowerCase()].sort().join("_");
 
-// Context Definition
+// ─── Context Definition ───────────────────────────────────────────────────────
 
 interface SocketContextValue {
-  socket: Socket<ServerToClientEvents, ClientToServerEvents> | null;
   isConnected: boolean;
-  currentUser: string | null;
   users: PresenceUser[];
-  messages: Record<string, DMMessage[]>; // keyed by channelId
-  register: (username: string) => void;
+  messages: Record<string, DMMessage[]>;
   sendDM: (recipientId: string, content: string) => void;
   fetchHistory: (targetUsername: string) => void;
   markRead: (channelId: string) => void;
@@ -66,36 +63,68 @@ interface SocketContextValue {
 
 const SocketContext = createContext<SocketContextValue | null>(null);
 
-// Provider
+// ─── Provider ─────────────────────────────────────────────────────────────────
 
-export function SocketProvider({ children }: { children: ReactNode }) {
-  const [socket] = useState<Socket<ServerToClientEvents, ClientToServerEvents>>(
-    () => {
-      const backendUrl =
-        process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:5001";
+interface SocketProviderProps {
+  token: string | null;
+  currentUsername: string | null;
+  onAuthError: () => void;
+  children: ReactNode;
+}
 
-      return io(backendUrl, {
-        autoConnect: true,
-        reconnectionAttempts: 5,
-      });
-    },
-  );
+export function SocketProvider({
+  token,
+  currentUsername,
+  onAuthError,
+  children,
+}: SocketProviderProps) {
+  const socketRef = useRef<Socket<
+    ServerToClientEvents,
+    ClientToServerEvents
+  > | null>(null);
   const [isConnected, setIsConnected] = useState(false);
-  const [currentUser, setCurrentUser] = useState<string | null>(null);
   const [users, setUsers] = useState<PresenceUser[]>([]);
   const [messages, setMessages] = useState<Record<string, DMMessage[]>>({});
 
   useEffect(() => {
-    // ── Connection lifecycle
-    socket.on("connect", () => setIsConnected(true));
-    socket.on("disconnect", () => setIsConnected(false));
+    // Don't connect without a valid token
+    if (!token || !currentUsername) return;
 
-    // ── Presence
-    socket.on("PRESENCE_SNAPSHOT", (snapshot) => {
+    const backendUrl =
+      process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:5001";
+
+    const newSocket: Socket<ServerToClientEvents, ClientToServerEvents> = io(
+      backendUrl,
+      {
+        auth: { token }, // JWT sent in handshake — verified by io.use() on server
+        reconnectionAttempts: 5,
+      },
+    );
+
+    socketRef.current = newSocket;
+
+    // ── Connection lifecycle ───────────────────────────────────────────────
+    newSocket.on("connect", () => setIsConnected(true));
+    newSocket.on("disconnect", () => setIsConnected(false));
+
+    // Server rejected the token (expired or invalid)
+    newSocket.on("connect_error", (err) => {
+      if (
+        err.message === "AUTH_REQUIRED" ||
+        err.message === "INVALID_TOKEN" ||
+        err.message === "TOKEN_EXPIRED"
+      ) {
+        onAuthError(); // clears token in useAuth → redirects to login
+        newSocket.disconnect();
+      }
+    });
+
+    // ── Presence ──────────────────────────────────────────────────────────
+    newSocket.on("PRESENCE_SNAPSHOT", (snapshot) => {
       setUsers(snapshot.map((u) => ({ ...u, lastSeen: new Date(u.lastSeen) })));
     });
 
-    socket.on("USER_ONLINE", ({ username }) => {
+    newSocket.on("USER_ONLINE", ({ username }) => {
       setUsers((prev) => {
         const exists = prev.find((u) => u.username === username);
         if (exists) {
@@ -107,7 +136,7 @@ export function SocketProvider({ children }: { children: ReactNode }) {
       });
     });
 
-    socket.on("USER_OFFLINE", ({ username, lastSeen }) => {
+    newSocket.on("USER_OFFLINE", ({ username, lastSeen }) => {
       setUsers((prev) =>
         prev.map((u) =>
           u.username === username
@@ -117,7 +146,7 @@ export function SocketProvider({ children }: { children: ReactNode }) {
       );
     });
 
-    // ── Messages
+    // ── Messages ──────────────────────────────────────────────────────────
     const appendMessage = (msg: DMMessage) => {
       const normalized = { ...msg, createdAt: new Date(msg.createdAt) };
       setMessages((prev) => {
@@ -128,9 +157,9 @@ export function SocketProvider({ children }: { children: ReactNode }) {
       });
     };
 
-    socket.on("DM_RECEIVED", appendMessage);
+    newSocket.on("DM_RECEIVED", appendMessage);
 
-    socket.on("DM_HISTORY", (history) => {
+    newSocket.on("DM_HISTORY", (history) => {
       if (history.length === 0) return;
       const channelId = history[0]!.channelId;
       setMessages((prev) => ({
@@ -142,71 +171,45 @@ export function SocketProvider({ children }: { children: ReactNode }) {
       }));
     });
 
-    socket.on("ERROR", ({ message }) => {
+    newSocket.on("ERROR", ({ message }) => {
       console.error("[Socket error]", message);
     });
 
     return () => {
-      socket.disconnect();
+      newSocket.disconnect();
+      if (socketRef.current === newSocket) {
+        socketRef.current = null;
+      }
+      setIsConnected(false);
     };
-  }, [socket]);
+  }, [token, currentUsername, onAuthError]); // reconnects only when token or user changes
 
-  const register = useCallback(
-    (username: string) => {
-      const trimmed = username.trim().toLowerCase();
-      setCurrentUser(trimmed);
-      socket?.emit("REGISTER", trimmed);
-    },
-    [socket],
-  );
+  // Actions
+  const sendDM = useCallback((recipientId: string, content: string) => {
+    socketRef.current?.emit("SEND_DM", { recipientId, content });
+  }, []);
 
-  const sendDM = useCallback(
-    (recipientId: string, content: string) => {
-      socket?.emit("SEND_DM", { recipientId, content });
-    },
-    [socket],
-  );
+  const fetchHistory = useCallback((targetUsername: string) => {
+    socketRef.current?.emit("FETCH_HISTORY", {
+      targetUsername,
+      limit: 50,
+    });
+  }, []);
 
-  const fetchHistory = useCallback(
-    (targetUsername: string) => {
-      socket?.emit("FETCH_HISTORY", {
-        targetUsername,
-        limit: 50,
-      });
-    },
-    [socket],
-  );
-
-  const markRead = useCallback(
-    (channelId: string) => {
-      socket?.emit("MARK_READ", { channelId });
-    },
-    [socket],
-  );
+  const markRead = useCallback((channelId: string) => {
+    socketRef.current?.emit("MARK_READ", { channelId });
+  }, []);
 
   const value = useMemo(
     () => ({
-      socket,
       isConnected,
-      currentUser,
       users,
       messages,
-      register,
       sendDM,
       fetchHistory,
       markRead,
     }),
-    [
-      socket,
-      isConnected,
-      currentUser,
-      users,
-      messages,
-      register,
-      sendDM,
-      fetchHistory,
-      markRead,
-    ],
+    [isConnected, users, messages, sendDM, fetchHistory, markRead],
   );
 
   return (

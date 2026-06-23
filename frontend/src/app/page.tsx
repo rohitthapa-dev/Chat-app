@@ -1,15 +1,46 @@
 "use client";
 
-import { useSocket } from "@/context/SocketContext";
-import LoginScreen from "@/components/LoginScreen";
-import ChatDashboard from "@/components/ChatDashboard";
+import { useCallback } from "react";
+import { useAuth } from "../hooks/useAuth";
+import { SocketProvider, useSocket } from "../context/SocketContext";
+import AuthScreen from "../components/AuthScreen";
+import ChatDashboard from "../components/ChatDashboard";
 
-export default function Home() {
-  const { currentUser } = useSocket();
+// Inner component — has access to SocketProvider context
 
-  if (!currentUser) {
-    return <LoginScreen />;
+function AppInner() {
+  const { user, isAuthenticated, register, login, logout } = useAuth();
+  const { isConnected } = useSocket();
+
+  if (!isAuthenticated || !user) {
+    return (
+      <AuthScreen
+        onRegister={register}
+        onLogin={login}
+        isConnected={isConnected}
+      />
+    );
   }
 
-  return <ChatDashboard />;
+  return <ChatDashboard currentUser={user.username} onLogout={logout} />;
+}
+
+// Root page
+
+export default function Page() {
+  const { token, user, logout } = useAuth();
+
+  const handleAuthError = useCallback(() => {
+    logout();
+  }, [logout]);
+
+  return (
+    <SocketProvider
+      token={token}
+      currentUsername={user?.username ?? null}
+      onAuthError={handleAuthError}
+    >
+      <AppInner />
+    </SocketProvider>
+  );
 }
