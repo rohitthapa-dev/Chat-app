@@ -37,12 +37,18 @@ interface ServerToClientEvents {
   DM_RECEIVED: (message: DMMessage) => void;
   DM_HISTORY: (messages: DMMessage[]) => void;
   ERROR: (payload: { message: string }) => void;
+  USER_TYPING: (payload: {
+    channelId: string;
+    username: string;
+    isTyping: boolean;
+  }) => void;
 }
 
 interface ClientToServerEvents {
   SEND_DM: (payload: { recipientId: string; content: string }) => void;
   FETCH_HISTORY: (payload: { targetUsername: string; limit?: number }) => void;
   MARK_READ: (payload: { channelId: string }) => void;
+  TYPING_STATUS: (payload: { recipientId: string; isTyping: boolean }) => void;
 }
 
 // ─── Shared utility: deterministic channel ID ─────────────────────────────────
@@ -59,6 +65,8 @@ interface SocketContextValue {
   sendDM: (recipientId: string, content: string) => void;
   fetchHistory: (targetUsername: string) => void;
   markRead: (channelId: string) => void;
+  typingUsers: Record<string, string[]>; // Maps channelId -> array of usernames typing in it
+  sendTypingStatus: (recipientId: string, isTyping: boolean) => void;
 }
 
 const SocketContext = createContext<SocketContextValue | null>(null);
@@ -85,6 +93,7 @@ export function SocketProvider({
   const [isConnected, setIsConnected] = useState(false);
   const [users, setUsers] = useState<PresenceUser[]>([]);
   const [messages, setMessages] = useState<Record<string, DMMessage[]>>({});
+  const [typingUsers, setTypingUsers] = useState<Record<string, string[]>>({});
 
   useEffect(() => {
     // Don't connect without a valid token
@@ -105,7 +114,10 @@ export function SocketProvider({
 
     // ── Connection lifecycle ───────────────────────────────────────────────
     newSocket.on("connect", () => setIsConnected(true));
-    newSocket.on("disconnect", () => setIsConnected(false));
+    newSocket.on("disconnect", () => {
+      setIsConnected(false);
+      setTypingUsers({}); // Clear transient typing indicators on disconnect
+    });
 
     // Server rejected the token (expired or invalid)
     newSocket.on("connect_error", (err) => {
@@ -175,6 +187,23 @@ export function SocketProvider({
       console.error("[Socket error]", message);
     });
 
+    // ── Typing ────────────────────────────────────────────────────────────
+    newSocket.on("USER_TYPING", ({ channelId, username, isTyping }) => {
+      setTypingUsers((prev) => {
+        const activeTypers = prev[channelId] ?? [];
+
+        if (isTyping) {
+          if (activeTypers.includes(username)) return prev;
+          return { ...prev, [channelId]: [...activeTypers, username] };
+        } else {
+          return {
+            ...prev,
+            [channelId]: activeTypers.filter((u) => u !== username),
+          };
+        }
+      });
+    });
+
     return () => {
       newSocket.disconnect();
       if (socketRef.current === newSocket) {
@@ -200,16 +229,34 @@ export function SocketProvider({
     socketRef.current?.emit("MARK_READ", { channelId });
   }, []);
 
+  const sendTypingStatus = useCallback(
+    (recipientId: string, isTyping: boolean) => {
+      socketRef.current?.emit("TYPING_STATUS", { recipientId, isTyping });
+    },
+    [],
+  );
+
   const value = useMemo(
     () => ({
       isConnected,
       users,
       messages,
+      typingUsers,
       sendDM,
       fetchHistory,
       markRead,
+      sendTypingStatus,
     }),
-    [isConnected, users, messages, sendDM, fetchHistory, markRead],
+    [
+      isConnected,
+      users,
+      messages,
+      typingUsers,
+      sendDM,
+      fetchHistory,
+      markRead,
+      sendTypingStatus,
+    ],
   );
 
   return (

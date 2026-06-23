@@ -10,7 +10,6 @@ import authRouter from "./routes/auth.js";
 import { verifyToken, type JWTPayload } from "./config/jwt.js";
 
 // Types
-
 interface ServerToClientEvents {
   USER_ONLINE: (payload: { username: string }) => void;
   USER_OFFLINE: (payload: { username: string; lastSeen: Date }) => void;
@@ -18,12 +17,18 @@ interface ServerToClientEvents {
   DM_RECEIVED: (message: SerializedMessage) => void;
   DM_HISTORY: (messages: SerializedMessage[]) => void;
   ERROR: (payload: { message: string }) => void;
+  USER_TYPING: (payload: {
+    channelId: string;
+    username: string;
+    isTyping: boolean;
+  }) => void;
 }
 
 interface ClientToServerEvents {
   SEND_DM: (payload: SendDMPayload) => void;
   FETCH_HISTORY: (payload: FetchHistoryPayload) => void;
   MARK_READ: (payload: { channelId: string }) => void;
+  TYPING_STATUS: (payload: { recipientId: string; isTyping: boolean }) => void;
 }
 
 interface SendDMPayload {
@@ -257,6 +262,21 @@ io.on(
       } catch (err) {
         console.error("MARK_READ error:", err);
       }
+    });
+
+    // ── TYPING_STATUS
+    socket.on("TYPING_STATUS", ({ recipientId, isTyping }) => {
+      if (!recipientId) return;
+
+      const targetRoom = recipientId.toLowerCase();
+      const channelId = getDMChannelId(username, targetRoom);
+
+      // Forward typing status to the recipient's personal socket room
+      io.to(targetRoom).emit("USER_TYPING", {
+        channelId,
+        username, // The person who is typing
+        isTyping,
+      });
     });
 
     // DISCONNECT

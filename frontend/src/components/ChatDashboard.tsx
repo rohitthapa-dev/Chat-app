@@ -94,12 +94,14 @@ function Sidebar({
   activeChat,
   onSelectChat,
   messages,
+  typingUsers,
 }: {
   users: PresenceUser[];
   currentUser: string;
   activeChat: string | null;
   onSelectChat: (username: string) => void;
   messages: Record<string, DMMessage[]>;
+  typingUsers: Record<string, string[]>;
 }) {
   const [search, setSearch] = useState("");
 
@@ -260,6 +262,10 @@ function Sidebar({
           peers.map((user) => {
             const lastMsg = getLastMessage(user.username);
             const isActive = activeChat === user.username;
+            const channelId = getDMChannelId(currentUser, user.username);
+            const isPeerTyping = typingUsers[channelId]?.includes(
+              user.username,
+            );
 
             return (
               <button
@@ -310,7 +316,7 @@ function Sidebar({
                     >
                       {user.username}
                     </span>
-                    {lastMsg && (
+                    {lastMsg && !isPeerTyping && (
                       <span
                         style={{
                           fontSize: 11,
@@ -325,18 +331,21 @@ function Sidebar({
                   <p
                     style={{
                       fontSize: 12.5,
-                      color: "#9B9BAD",
+                      color: isPeerTyping ? "#22c55e" : "#9B9BAD",
+                      fontWeight: isPeerTyping ? 500 : 400,
                       margin: "2px 0 0",
                       whiteSpace: "nowrap",
                       overflow: "hidden",
                       textOverflow: "ellipsis",
                     }}
                   >
-                    {lastMsg
-                      ? lastMsg.content
-                      : user.isOnline
-                        ? "Online now"
-                        : `Last seen ${formatLastSeen(new Date(user.lastSeen))}`}
+                    {isPeerTyping
+                      ? "typing..."
+                      : lastMsg
+                        ? lastMsg.content
+                        : user.isOnline
+                          ? "Online now"
+                          : `Last seen ${formatLastSeen(new Date(user.lastSeen))}`}
                   </p>
                 </div>
               </button>
@@ -387,6 +396,8 @@ function ChatWindow({
   channelMessages,
   onSendDM,
   onMarkRead,
+  isTypingActive,
+  onTypingStatusChange,
 }: {
   peerUsername: string;
   peerUser: PresenceUser | undefined;
@@ -394,9 +405,13 @@ function ChatWindow({
   channelMessages: DMMessage[];
   onSendDM: (content: string) => void;
   onMarkRead: () => void;
+  isTypingActive: boolean;
+  onTypingStatusChange: (isTyping: boolean) => void;
 }) {
   const [draft, setDraft] = useState("");
   const bottomRef = useRef<HTMLDivElement>(null);
+  const typingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const isTypingRef = useRef(false);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -406,8 +421,31 @@ function ChatWindow({
   const handleSend = () => {
     const trimmed = draft.trim();
     if (!trimmed) return;
+
+    // Clear out typing loops immediately when messaging goes through
+    if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+    onTypingStatusChange(false);
+    isTypingRef.current = false;
+
     onSendDM(trimmed);
     setDraft("");
+  };
+
+  const handleInputChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    setDraft(e.target.value);
+
+    // If we haven't flagged typing state yet, fire standard trigger event
+    if (!isTypingRef.current) {
+      isTypingRef.current = true;
+      onTypingStatusChange(true);
+    }
+
+    // Bounce checking logic to drop flag if writing goes silent
+    if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+    typingTimeoutRef.current = setTimeout(() => {
+      onTypingStatusChange(false);
+      isTypingRef.current = false;
+    }, 2500);
   };
 
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -580,80 +618,104 @@ function ChatWindow({
         <div ref={bottomRef} />
       </div>
 
-      {/* Input bar */}
+      {/* Input container wrapper with localized typing preview */}
       <div
         style={{
           background: "#FFFFFF",
           padding: "12px 20px",
           display: "flex",
-          alignItems: "flex-end",
-          gap: 12,
+          flexDirection: "column",
+          gap: 6,
           borderTop: "1px solid #EFEFEF",
+          position: "relative",
         }}
       >
-        <textarea
-          value={draft}
-          onChange={(e) => setDraft(e.target.value)}
-          onKeyDown={handleKeyDown}
-          placeholder="Type a message…"
-          rows={1}
+        {isTypingActive && (
+          <div
+            style={{
+              fontSize: 12,
+              color: "#22c55e",
+              fontWeight: 500,
+              paddingLeft: 4,
+              animation: "pulse 1.5s infinite",
+            }}
+          >
+            {peerUsername} is typing...
+          </div>
+        )}
+
+        <div
           style={{
-            flex: 1,
-            background: "#F7F5F2",
-            border: "1.5px solid #EFEFEF",
-            borderRadius: 12,
-            padding: "10px 14px",
-            fontSize: 14,
-            color: "#1A1A2E",
-            outline: "none",
-            resize: "none",
-            maxHeight: 120,
-            lineHeight: 1.5,
-            fontFamily: "inherit",
-            transition: "border-color 0.15s",
-          }}
-          onFocus={(e) => (e.currentTarget.style.borderColor = "#6C63FF")}
-          onBlur={(e) => (e.currentTarget.style.borderColor = "#EFEFEF")}
-        />
-        <button
-          onClick={handleSend}
-          disabled={!draft.trim()}
-          style={{
-            width: 42,
-            height: 42,
-            flexShrink: 0,
-            borderRadius: 12,
-            border: "none",
-            background: draft.trim()
-              ? "linear-gradient(135deg, #6C63FF 0%, #8B83FF 100%)"
-              : "#E8E6FF",
-            cursor: draft.trim() ? "pointer" : "not-allowed",
             display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            transition: "opacity 0.15s",
-            boxShadow: draft.trim()
-              ? "0 4px 12px rgba(108,99,255,0.28)"
-              : "none",
-          }}
-          onMouseEnter={(e) => {
-            if (draft.trim()) e.currentTarget.style.opacity = "0.85";
-          }}
-          onMouseLeave={(e) => {
-            e.currentTarget.style.opacity = "1";
+            alignItems: "flex-end",
+            gap: 12,
+            width: "100%",
           }}
         >
-          <svg
-            xmlns="http://www.w3.org/2000/svg"
-            viewBox="0 0 24 24"
-            fill={draft.trim() ? "white" : "#9B9BAD"}
-            width={18}
-            height={18}
-            style={{ transform: "translateX(1px)" }}
+          <textarea
+            value={draft}
+            onChange={handleInputChange}
+            onKeyDown={handleKeyDown}
+            placeholder="Type a message…"
+            rows={1}
+            style={{
+              flex: 1,
+              background: "#F7F5F2",
+              border: "1.5px solid #EFEFEF",
+              borderRadius: 12,
+              padding: "10px 14px",
+              fontSize: 14,
+              color: "#1A1A2E",
+              outline: "none",
+              resize: "none",
+              maxHeight: 120,
+              lineHeight: 1.5,
+              fontFamily: "inherit",
+              transition: "border-color 0.15s",
+            }}
+            onFocus={(e) => (e.currentTarget.style.borderColor = "#6C63FF")}
+            onBlur={(e) => (e.currentTarget.style.borderColor = "#EFEFEF")}
+          />
+          <button
+            onClick={handleSend}
+            disabled={!draft.trim()}
+            style={{
+              width: 42,
+              height: 42,
+              flexShrink: 0,
+              borderRadius: 12,
+              border: "none",
+              background: draft.trim()
+                ? "linear-gradient(135deg, #6C63FF 0%, #8B83FF 100%)"
+                : "#E8E6FF",
+              cursor: draft.trim() ? "pointer" : "not-allowed",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              transition: "opacity 0.15s",
+              boxShadow: draft.trim()
+                ? "0 4px 12px rgba(108,99,255,0.28)"
+                : "none",
+            }}
+            onMouseEnter={(e) => {
+              if (draft.trim()) e.currentTarget.style.opacity = "0.85";
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.opacity = "1";
+            }}
           >
-            <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z" />
-          </svg>
-        </button>
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              viewBox="0 0 24 24"
+              fill={draft.trim() ? "white" : "#9B9BAD"}
+              width={18}
+              height={18}
+              style={{ transform: "translateX(1px)" }}
+            >
+              <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z" />
+            </svg>
+          </button>
+        </div>
       </div>
     </div>
   );
@@ -735,7 +797,15 @@ export default function ChatDashboard({
   currentUser: currentUserProp,
   onLogout,
 }: ChatDashboardProps) {
-  const { users, messages, sendDM, fetchHistory, markRead } = useSocket();
+  const {
+    users,
+    messages,
+    typingUsers,
+    sendDM,
+    fetchHistory,
+    markRead,
+    sendTypingStatus,
+  } = useSocket();
   const [activeChat, setActiveChat] = useState<string | null>(null);
 
   const currentUser = currentUserProp;
@@ -757,6 +827,11 @@ export default function ChatDashboard({
     markRead(channelId);
   };
 
+  const handleTypingStatusChange = (isTyping: boolean) => {
+    if (!activeChat) return;
+    sendTypingStatus(activeChat, isTyping);
+  };
+
   const activeChannelId = activeChat
     ? getDMChannelId(currentUser, activeChat)
     : null;
@@ -767,6 +842,13 @@ export default function ChatDashboard({
     ? users.find((u) => u.username === activeChat)
     : undefined;
 
+  // Determine if the current peer user is typing inside the active channel
+  const isPeerTypingInActiveChannel = !!(
+    activeChannelId &&
+    activeChat &&
+    typingUsers[activeChannelId]?.includes(activeChat)
+  );
+
   return (
     <div style={{ height: "100vh", display: "flex", overflow: "hidden" }}>
       <Sidebar
@@ -775,15 +857,19 @@ export default function ChatDashboard({
         activeChat={activeChat}
         onSelectChat={handleSelectChat}
         messages={messages}
+        typingUsers={typingUsers}
       />
       {activeChat ? (
         <ChatWindow
+          key={activeChat}
           peerUsername={activeChat}
           peerUser={activePeerUser}
           currentUser={currentUser}
           channelMessages={activeMessages}
           onSendDM={handleSendDM}
           onMarkRead={handleMarkRead}
+          isTypingActive={isPeerTypingInActiveChannel}
+          onTypingStatusChange={handleTypingStatusChange}
         />
       ) : (
         <EmptyState />
