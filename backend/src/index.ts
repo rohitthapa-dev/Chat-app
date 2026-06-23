@@ -6,8 +6,10 @@ import { Server, Socket } from "socket.io";
 import connectDB from "./config/db.js";
 import User from "./models/User.js";
 import Message, { getDMChannelId } from "./models/Message.js";
+import authRouter from "./routes/auth.js";
+import { verifyToken, type JWTPayload } from "./config/jwt.js";
 
-// ─── Types ────────────────────────────────────────────────────────────────────
+// Types
 
 interface ServerToClientEvents {
   USER_ONLINE: (payload: { username: string }) => void;
@@ -19,7 +21,6 @@ interface ServerToClientEvents {
 }
 
 interface ClientToServerEvents {
-  REGISTER: (username: string) => void;
   SEND_DM: (payload: SendDMPayload) => void;
   FETCH_HISTORY: (payload: FetchHistoryPayload) => void;
   MARK_READ: (payload: { channelId: string }) => void;
@@ -33,7 +34,7 @@ interface SendDMPayload {
 interface FetchHistoryPayload {
   targetUsername: string;
   limit?: number;
-  before?: string; // ISO date string for pagination
+  before?: string;
 }
 
 interface PresenceUser {
@@ -52,14 +53,16 @@ interface SerializedMessage {
   createdAt: Date;
 }
 
-// ─── Maps: socket ↔ username ──────────────────────────────────────────────────
+interface SocketData {
+  user: JWTPayload; // { userId, username }
+}
 
-// Maps socketId → username (for disconnect cleanup)
+//  Maps: socket ↔ username
+
 const socketToUser = new Map<string, string>();
-// Maps username → socketId (for targeted DM delivery)
 const userToSocket = new Map<string, string>();
 
-// ─── App Setup ────────────────────────────────────────────────────────────────
+//  App Setup
 
 await connectDB();
 
@@ -69,20 +72,29 @@ app.use(express.json());
 
 const httpServer = http.createServer(app);
 
-const io = new Server<ClientToServerEvents, ServerToClientEvents>(httpServer, {
+const io = new Server<
+  ClientToServerEvents,
+  ServerToClientEvents,
+  Record<string, never>,
+  SocketData
+>(httpServer, {
   cors: {
     origin: process.env.FRONTEND_URL ?? "http://localhost:3000",
     methods: ["GET", "POST"],
   },
 });
 
-// ─── REST: Health ─────────────────────────────────────────────────────────────
+//  REST: Health
 
 app.get("/health", (_req, res) => {
   res.json({ status: "ok", timestamp: new Date().toISOString() });
 });
 
-// ─── REST: All Users (for friend list on load) ────────────────────────────────
+// REST: Auth
+
+app.use("/api/auth", authRouter);
+
+//  REST: All Users
 
 app.get("/api/users", async (_req, res) => {
   try {
@@ -96,79 +108,85 @@ app.get("/api/users", async (_req, res) => {
   }
 });
 
-// ─── Socket.IO: Core Event Loop ───────────────────────────────────────────────
+// Socket.IO: Auth Middleware
+
+io.use((socket, next) => {
+  const token = socket.handshake.auth?.token as string | undefined;
+
+  if (!token) {
+    return next(new Error("AUTH_REQUIRED"));
+  }
+
+  try {
+    const payload = verifyToken(token);
+    socket.data.user = payload;
+    next();
+  } catch (err: any) {
+    if (err.name === "TokenExpiredError") {
+      return next(new Error("TOKEN_EXPIRED"));
+    }
+    return next(new Error("INVALID_TOKEN"));
+  }
+});
+
+// Socket.IO: Core Event Loop
 
 io.on(
   "connection",
-  (socket: Socket<ClientToServerEvents, ServerToClientEvents>) => {
-    console.log(`🔌 Socket connected: ${socket.id}`);
+  async (
+    socket: Socket<
+      ClientToServerEvents,
+      ServerToClientEvents,
+      Record<string, never>,
+      SocketData
+    >,
+  ) => {
+    const { userId, username } = socket.data.user;
 
-    // ── REGISTER ──────────────────────────────────────────────────────────────
-    socket.on("REGISTER", async (username: string) => {
-      if (!username || typeof username !== "string") {
-        socket.emit("ERROR", { message: "Invalid username." });
-        return;
-      }
+    console.log(`🔌 Socket connected: ${username} (${socket.id})`);
 
-      const sanitized = username.trim().toLowerCase();
+    socketToUser.set(socket.id, username);
+    userToSocket.set(username, socket.id);
+    void socket.join(username);
 
-      try {
-        // Upsert: create or update user, mark online
-        await User.findOneAndUpdate(
-          { username: sanitized },
-          { isOnline: true, lastSeen: new Date() },
-          { upsert: true, new: true },
-        );
+    try {
+      // Step 1: mark this user online — MUST be awaited first
+      await User.findByIdAndUpdate(userId, {
+        isOnline: true,
+        lastSeen: new Date(),
+      });
 
-        // Register bidirectional maps
-        socketToUser.set(socket.id, sanitized);
-        userToSocket.set(sanitized, socket.id);
+      // Step 2: fetch snapshot AFTER the write is committed
+      // so this user appears as online in their own sidebar too
+      const allUsers = await User.find(
+        {},
+        { username: 1, isOnline: 1, lastSeen: 1, _id: 0 },
+      );
+      socket.emit("PRESENCE_SNAPSHOT", allUsers as PresenceUser[]);
 
-        // Join personal room for targeted delivery
-        void socket.join(sanitized);
+      // Step 3: tell everyone else this user is online
+      socket.broadcast.emit("USER_ONLINE", { username });
+    } catch (err) {
+      console.error("Connection setup error:", err);
+    }
 
-        console.log(`👤 Registered: ${sanitized} (${socket.id})`);
-
-        // Send full presence snapshot to the newly connected user
-        const allUsers = await User.find(
-          {},
-          { username: 1, isOnline: 1, lastSeen: 1, _id: 0 },
-        );
-        socket.emit("PRESENCE_SNAPSHOT", allUsers as PresenceUser[]);
-
-        // Broadcast USER_ONLINE to all OTHER connected sockets
-        socket.broadcast.emit("USER_ONLINE", { username: sanitized });
-      } catch (err) {
-        console.error("REGISTER error:", err);
-        socket.emit("ERROR", { message: "Registration failed. Try again." });
-      }
-    });
-
-    // ── SEND_DM ───────────────────────────────────────────────────────────────
+    // ── SEND_DM
     socket.on("SEND_DM", async ({ recipientId, content }: SendDMPayload) => {
-      const senderId = socketToUser.get(socket.id);
-
-      if (!senderId) {
-        socket.emit("ERROR", { message: "Not registered. Please reconnect." });
-        return;
-      }
-
       if (!recipientId || !content?.trim()) {
         socket.emit("ERROR", { message: "Invalid message payload." });
         return;
       }
 
-      if (senderId === recipientId.toLowerCase()) {
+      if (username === recipientId.toLowerCase()) {
         socket.emit("ERROR", { message: "Cannot send a DM to yourself." });
         return;
       }
 
-      const channelId = getDMChannelId(senderId, recipientId);
+      const channelId = getDMChannelId(username, recipientId);
 
       try {
-        // Persist to Atlas
         const saved = await Message.create({
-          senderId,
+          senderId: username,
           recipientId: recipientId.toLowerCase(),
           channelId,
           content: content.trim(),
@@ -185,10 +203,7 @@ io.on(
           createdAt: saved.createdAt,
         };
 
-        // Echo back to sender (their own chat window updates)
         socket.emit("DM_RECEIVED", serialized);
-
-        // Deliver to recipient's personal room (handles multi-tab too)
         io.to(recipientId.toLowerCase()).emit("DM_RECEIVED", serialized);
       } catch (err) {
         console.error("SEND_DM error:", err);
@@ -196,18 +211,11 @@ io.on(
       }
     });
 
-    // ── FETCH_HISTORY ─────────────────────────────────────────────────────────
+    // ── FETCH_HISTORY
     socket.on(
       "FETCH_HISTORY",
       async ({ targetUsername, limit = 50, before }: FetchHistoryPayload) => {
-        const requestingUser = socketToUser.get(socket.id);
-
-        if (!requestingUser) {
-          socket.emit("ERROR", { message: "Not registered." });
-          return;
-        }
-
-        const channelId = getDMChannelId(requestingUser, targetUsername);
+        const channelId = getDMChannelId(username, targetUsername);
 
         try {
           const query: Record<string, unknown> = { channelId };
@@ -239,11 +247,8 @@ io.on(
       },
     );
 
-    // ── MARK_READ ─────────────────────────────────────────────────────────────
+    // ── MARK_READ
     socket.on("MARK_READ", async ({ channelId }: { channelId: string }) => {
-      const username = socketToUser.get(socket.id);
-      if (!username) return;
-
       try {
         await Message.updateMany(
           { channelId, recipientId: username, read: false },
@@ -254,35 +259,26 @@ io.on(
       }
     });
 
-    // ── DISCONNECT ────────────────────────────────────────────────────────────
+    // DISCONNECT
     socket.on("disconnect", async () => {
-      const username = socketToUser.get(socket.id);
+      socketToUser.delete(socket.id);
+      userToSocket.delete(username);
 
-      if (username) {
-        socketToUser.delete(socket.id);
-        userToSocket.delete(username);
+      const lastSeen = new Date();
 
-        const lastSeen = new Date();
-
-        try {
-          await User.findOneAndUpdate(
-            { username },
-            { isOnline: false, lastSeen },
-          );
-        } catch (err) {
-          console.error("Presence cleanup error:", err);
-        }
-
-        // Broadcast USER_OFFLINE with lastSeen to all remaining peers
-        io.emit("USER_OFFLINE", { username, lastSeen });
-        console.log(`👋 Disconnected: ${username} (${socket.id})`);
+      try {
+        await User.findByIdAndUpdate(userId, { isOnline: false, lastSeen });
+      } catch (err) {
+        console.error("Presence cleanup error:", err);
       }
+
+      io.emit("USER_OFFLINE", { username, lastSeen });
+      console.log(`👋 Disconnected: ${username} (${socket.id})`);
     });
   },
 );
 
-// ─── Start ────────────────────────────────────────────────────────────────────
-
+// Start
 const PORT = Number(process.env.PORT) || 5001;
 
 httpServer.listen(PORT, () => {
