@@ -46,7 +46,6 @@ function UserAvatar({
   };
   const s = sizes[size];
 
-  // Deterministic pastel hue from username
   const hue =
     username.split("").reduce((acc, ch) => acc + ch.charCodeAt(0), 0) % 360;
 
@@ -86,6 +85,33 @@ function UserAvatar({
   );
 }
 
+// Unread badge
+
+function UnreadBadge({ count }: { count: number }) {
+  if (count === 0) return null;
+  return (
+    <span
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        minWidth: 20,
+        height: 20,
+        padding: "0 6px",
+        borderRadius: 10,
+        backgroundColor: "#6C63FF",
+        color: "#ffffff",
+        fontSize: 11,
+        fontWeight: 700,
+        lineHeight: 1,
+        flexShrink: 0,
+      }}
+    >
+      {count > 99 ? "99+" : count}
+    </span>
+  );
+}
+
 //  Sidebar
 
 function Sidebar({
@@ -94,12 +120,16 @@ function Sidebar({
   activeChat,
   onSelectChat,
   messages,
+  typingUsers,
+  unreadCounts,
 }: {
   users: PresenceUser[];
   currentUser: string;
   activeChat: string | null;
   onSelectChat: (username: string) => void;
   messages: Record<string, DMMessage[]>;
+  typingUsers: Record<string, string[]>;
+  unreadCounts: Record<string, number>;
 }) {
   const [search, setSearch] = useState("");
 
@@ -224,11 +254,7 @@ function Sidebar({
       </div>
 
       {/* Section label */}
-      <div
-        style={{
-          padding: "12px 20px 6px",
-        }}
-      >
+      <div style={{ padding: "12px 20px 6px" }}>
         <span
           style={{
             fontSize: 11,
@@ -260,6 +286,11 @@ function Sidebar({
           peers.map((user) => {
             const lastMsg = getLastMessage(user.username);
             const isActive = activeChat === user.username;
+            const channelId = getDMChannelId(currentUser, user.username);
+            const isPeerTyping = typingUsers[channelId]?.includes(
+              user.username,
+            );
+            const unread = unreadCounts[channelId] ?? 0;
 
             return (
               <button
@@ -289,54 +320,68 @@ function Sidebar({
                 }}
               >
                 <UserAvatar username={user.username} isOnline={user.isOnline} />
+
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <div
                     style={{
                       display: "flex",
                       justifyContent: "space-between",
                       alignItems: "center",
+                      gap: 6,
                     }}
                   >
                     <span
                       style={{
                         fontSize: 14,
-                        fontWeight: 600,
+                        fontWeight: unread > 0 ? 700 : 600,
                         color: "#1A1A2E",
                         whiteSpace: "nowrap",
                         overflow: "hidden",
                         textOverflow: "ellipsis",
-                        maxWidth: 140,
+                        maxWidth: 110,
                       }}
                     >
                       {user.username}
                     </span>
-                    {lastMsg && (
-                      <span
-                        style={{
-                          fontSize: 11,
-                          color: "#C2C2CE",
-                          flexShrink: 0,
-                        }}
-                      >
-                        {formatMessageTime(lastMsg.createdAt)}
-                      </span>
-                    )}
+                    <div
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 6,
+                        flexShrink: 0,
+                      }}
+                    >
+                      {lastMsg && !isPeerTyping && unread === 0 && (
+                        <span style={{ fontSize: 11, color: "#C2C2CE" }}>
+                          {formatMessageTime(lastMsg.createdAt)}
+                        </span>
+                      )}
+                      <UnreadBadge count={unread} />
+                    </div>
                   </div>
+
                   <p
                     style={{
                       fontSize: 12.5,
-                      color: "#9B9BAD",
+                      color: isPeerTyping
+                        ? "#22c55e"
+                        : unread > 0
+                          ? "#1A1A2E"
+                          : "#9B9BAD",
+                      fontWeight: isPeerTyping || unread > 0 ? 500 : 400,
                       margin: "2px 0 0",
                       whiteSpace: "nowrap",
                       overflow: "hidden",
                       textOverflow: "ellipsis",
                     }}
                   >
-                    {lastMsg
-                      ? lastMsg.content
-                      : user.isOnline
-                        ? "Online now"
-                        : `Last seen ${formatLastSeen(new Date(user.lastSeen))}`}
+                    {isPeerTyping
+                      ? "typing..."
+                      : lastMsg
+                        ? lastMsg.content
+                        : user.isOnline
+                          ? "Online now"
+                          : `Last seen ${formatLastSeen(new Date(user.lastSeen))}`}
                   </p>
                 </div>
               </button>
@@ -387,6 +432,8 @@ function ChatWindow({
   channelMessages,
   onSendDM,
   onMarkRead,
+  isTypingActive,
+  onTypingStatusChange,
 }: {
   peerUsername: string;
   peerUser: PresenceUser | undefined;
@@ -394,9 +441,13 @@ function ChatWindow({
   channelMessages: DMMessage[];
   onSendDM: (content: string) => void;
   onMarkRead: () => void;
+  isTypingActive: boolean;
+  onTypingStatusChange: (isTyping: boolean) => void;
 }) {
   const [draft, setDraft] = useState("");
   const bottomRef = useRef<HTMLDivElement>(null);
+  const typingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const isTypingRef = useRef(false);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -406,8 +457,28 @@ function ChatWindow({
   const handleSend = () => {
     const trimmed = draft.trim();
     if (!trimmed) return;
+
+    if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+    onTypingStatusChange(false);
+    isTypingRef.current = false;
+
     onSendDM(trimmed);
     setDraft("");
+  };
+
+  const handleInputChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    setDraft(e.target.value);
+
+    if (!isTypingRef.current) {
+      isTypingRef.current = true;
+      onTypingStatusChange(true);
+    }
+
+    if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+    typingTimeoutRef.current = setTimeout(() => {
+      onTypingStatusChange(false);
+      isTypingRef.current = false;
+    }, 2500);
   };
 
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -580,80 +651,104 @@ function ChatWindow({
         <div ref={bottomRef} />
       </div>
 
-      {/* Input bar */}
+      {/* Input */}
       <div
         style={{
           background: "#FFFFFF",
           padding: "12px 20px",
           display: "flex",
-          alignItems: "flex-end",
-          gap: 12,
+          flexDirection: "column",
+          gap: 6,
           borderTop: "1px solid #EFEFEF",
+          position: "relative",
         }}
       >
-        <textarea
-          value={draft}
-          onChange={(e) => setDraft(e.target.value)}
-          onKeyDown={handleKeyDown}
-          placeholder="Type a message…"
-          rows={1}
+        {isTypingActive && (
+          <div
+            style={{
+              fontSize: 12,
+              color: "#22c55e",
+              fontWeight: 500,
+              paddingLeft: 4,
+              animation: "pulse 1.5s infinite",
+            }}
+          >
+            {peerUsername} is typing...
+          </div>
+        )}
+
+        <div
           style={{
-            flex: 1,
-            background: "#F7F5F2",
-            border: "1.5px solid #EFEFEF",
-            borderRadius: 12,
-            padding: "10px 14px",
-            fontSize: 14,
-            color: "#1A1A2E",
-            outline: "none",
-            resize: "none",
-            maxHeight: 120,
-            lineHeight: 1.5,
-            fontFamily: "inherit",
-            transition: "border-color 0.15s",
-          }}
-          onFocus={(e) => (e.currentTarget.style.borderColor = "#6C63FF")}
-          onBlur={(e) => (e.currentTarget.style.borderColor = "#EFEFEF")}
-        />
-        <button
-          onClick={handleSend}
-          disabled={!draft.trim()}
-          style={{
-            width: 42,
-            height: 42,
-            flexShrink: 0,
-            borderRadius: 12,
-            border: "none",
-            background: draft.trim()
-              ? "linear-gradient(135deg, #6C63FF 0%, #8B83FF 100%)"
-              : "#E8E6FF",
-            cursor: draft.trim() ? "pointer" : "not-allowed",
             display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            transition: "opacity 0.15s",
-            boxShadow: draft.trim()
-              ? "0 4px 12px rgba(108,99,255,0.28)"
-              : "none",
-          }}
-          onMouseEnter={(e) => {
-            if (draft.trim()) e.currentTarget.style.opacity = "0.85";
-          }}
-          onMouseLeave={(e) => {
-            e.currentTarget.style.opacity = "1";
+            alignItems: "flex-end",
+            gap: 12,
+            width: "100%",
           }}
         >
-          <svg
-            xmlns="http://www.w3.org/2000/svg"
-            viewBox="0 0 24 24"
-            fill={draft.trim() ? "white" : "#9B9BAD"}
-            width={18}
-            height={18}
-            style={{ transform: "translateX(1px)" }}
+          <textarea
+            value={draft}
+            onChange={handleInputChange}
+            onKeyDown={handleKeyDown}
+            placeholder="Type a message…"
+            rows={1}
+            style={{
+              flex: 1,
+              background: "#F7F5F2",
+              border: "1.5px solid #EFEFEF",
+              borderRadius: 12,
+              padding: "10px 14px",
+              fontSize: 14,
+              color: "#1A1A2E",
+              outline: "none",
+              resize: "none",
+              maxHeight: 120,
+              lineHeight: 1.5,
+              fontFamily: "inherit",
+              transition: "border-color 0.15s",
+            }}
+            onFocus={(e) => (e.currentTarget.style.borderColor = "#6C63FF")}
+            onBlur={(e) => (e.currentTarget.style.borderColor = "#EFEFEF")}
+          />
+          <button
+            onClick={handleSend}
+            disabled={!draft.trim()}
+            style={{
+              width: 42,
+              height: 42,
+              flexShrink: 0,
+              borderRadius: 12,
+              border: "none",
+              background: draft.trim()
+                ? "linear-gradient(135deg, #6C63FF 0%, #8B83FF 100%)"
+                : "#E8E6FF",
+              cursor: draft.trim() ? "pointer" : "not-allowed",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              transition: "opacity 0.15s",
+              boxShadow: draft.trim()
+                ? "0 4px 12px rgba(108,99,255,0.28)"
+                : "none",
+            }}
+            onMouseEnter={(e) => {
+              if (draft.trim()) e.currentTarget.style.opacity = "0.85";
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.opacity = "1";
+            }}
           >
-            <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z" />
-          </svg>
-        </button>
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              viewBox="0 0 24 24"
+              fill={draft.trim() ? "white" : "#9B9BAD"}
+              width={18}
+              height={18}
+              style={{ transform: "translateX(1px)" }}
+            >
+              <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z" />
+            </svg>
+          </button>
+        </div>
       </div>
     </div>
   );
@@ -724,17 +819,44 @@ function EmptyState() {
   );
 }
 
+interface ChatDashboardProps {
+  currentUser?: string;
+  onLogout?: () => void;
+}
+
 // Main Dashboard
 
-export default function ChatDashboard() {
-  const { currentUser, users, messages, sendDM, fetchHistory, markRead } =
-    useSocket();
+export default function ChatDashboard({
+  currentUser: currentUserProp,
+  onLogout,
+}: ChatDashboardProps) {
+  const {
+    users,
+    messages,
+    unreadCounts,
+    typingUsers,
+    sendDM,
+    fetchHistory,
+    markRead,
+    clearUnread,
+    setActiveChannel,
+    sendTypingStatus,
+  } = useSocket();
   const [activeChat, setActiveChat] = useState<string | null>(null);
 
+  const currentUser = currentUserProp;
   if (!currentUser) return null;
 
   const handleSelectChat = (peerUsername: string) => {
     setActiveChat(peerUsername);
+
+    // Tell the context which channel is now open
+    const channelId = getDMChannelId(currentUser, peerUsername);
+    setActiveChannel(channelId);
+
+    // Clear the unread badge + notify server
+    clearUnread(channelId);
+
     fetchHistory(peerUsername);
   };
 
@@ -749,6 +871,11 @@ export default function ChatDashboard() {
     markRead(channelId);
   };
 
+  const handleTypingStatusChange = (isTyping: boolean) => {
+    if (!activeChat) return;
+    sendTypingStatus(activeChat, isTyping);
+  };
+
   const activeChannelId = activeChat
     ? getDMChannelId(currentUser, activeChat)
     : null;
@@ -759,6 +886,12 @@ export default function ChatDashboard() {
     ? users.find((u) => u.username === activeChat)
     : undefined;
 
+  const isPeerTypingInActiveChannel = !!(
+    activeChannelId &&
+    activeChat &&
+    typingUsers[activeChannelId]?.includes(activeChat)
+  );
+
   return (
     <div style={{ height: "100vh", display: "flex", overflow: "hidden" }}>
       <Sidebar
@@ -767,19 +900,46 @@ export default function ChatDashboard() {
         activeChat={activeChat}
         onSelectChat={handleSelectChat}
         messages={messages}
+        typingUsers={typingUsers}
+        unreadCounts={unreadCounts}
       />
       {activeChat ? (
         <ChatWindow
+          key={activeChat}
           peerUsername={activeChat}
           peerUser={activePeerUser}
           currentUser={currentUser}
           channelMessages={activeMessages}
           onSendDM={handleSendDM}
           onMarkRead={handleMarkRead}
+          isTypingActive={isPeerTypingInActiveChannel}
+          onTypingStatusChange={handleTypingStatusChange}
         />
       ) : (
         <EmptyState />
       )}
+      {onLogout ? (
+        <button
+          onClick={onLogout}
+          style={{
+            position: "fixed",
+            top: 16,
+            right: 16,
+            zIndex: 10,
+            border: "none",
+            background: "#FFFFFF",
+            borderRadius: 999,
+            padding: "10px 14px",
+            boxShadow: "0 2px 10px rgba(0,0,0,0.08)",
+            cursor: "pointer",
+            fontSize: 13,
+            fontWeight: 600,
+            color: "#1A1A2E",
+          }}
+        >
+          Log out
+        </button>
+      ) : null}
     </div>
   );
 }
