@@ -62,10 +62,13 @@ interface SocketContextValue {
   isConnected: boolean;
   users: PresenceUser[];
   messages: Record<string, DMMessage[]>;
+  unreadCounts: Record<string, number>;
   sendDM: (recipientId: string, content: string) => void;
   fetchHistory: (targetUsername: string) => void;
   markRead: (channelId: string) => void;
-  typingUsers: Record<string, string[]>; // Maps channelId -> array of usernames typing in it
+  clearUnread: (channelId: string) => void;
+  setActiveChannel: (channelId: string | null) => void;
+  typingUsers: Record<string, string[]>;
   sendTypingStatus: (recipientId: string, isTyping: boolean) => void;
 }
 
@@ -94,18 +97,21 @@ export function SocketProvider({
   const [users, setUsers] = useState<PresenceUser[]>([]);
   const [messages, setMessages] = useState<Record<string, DMMessage[]>>({});
   const [typingUsers, setTypingUsers] = useState<Record<string, string[]>>({});
+  const [unreadCounts, setUnreadCounts] = useState<Record<string, number>>({});
+
+  // Ref so DM_RECEIVED always reads the latest active channel
+  // without needing the effect to be recreated on every channel switch.
+  const activeChannelRef = useRef<string | null>(null);
 
   useEffect(() => {
-    // Don't connect without a valid token
     if (!token || !currentUsername) return;
 
-    const backendUrl =
-      process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:5001";
+    const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL;
 
     const newSocket: Socket<ServerToClientEvents, ClientToServerEvents> = io(
       backendUrl,
       {
-        auth: { token }, // JWT sent in handshake — verified by io.use() on server
+        auth: { token },
         reconnectionAttempts: 5,
       },
     );
@@ -116,17 +122,16 @@ export function SocketProvider({
     newSocket.on("connect", () => setIsConnected(true));
     newSocket.on("disconnect", () => {
       setIsConnected(false);
-      setTypingUsers({}); // Clear transient typing indicators on disconnect
+      setTypingUsers({});
     });
 
-    // Server rejected the token (expired or invalid)
     newSocket.on("connect_error", (err) => {
       if (
         err.message === "AUTH_REQUIRED" ||
         err.message === "INVALID_TOKEN" ||
         err.message === "TOKEN_EXPIRED"
       ) {
-        onAuthError(); // clears token in useAuth → redirects to login
+        onAuthError();
         newSocket.disconnect();
       }
     });
@@ -161,12 +166,25 @@ export function SocketProvider({
     // ── Messages ──────────────────────────────────────────────────────────
     const appendMessage = (msg: DMMessage) => {
       const normalized = { ...msg, createdAt: new Date(msg.createdAt) };
+
       setMessages((prev) => {
         const channel = prev[msg.channelId] ?? [];
-        // Deduplicate by _id
         if (channel.some((m) => m._id === msg._id)) return prev;
         return { ...prev, [msg.channelId]: [...channel, normalized] };
       });
+
+      // Increment unread only when:
+      // 1. Message is from someone else (not our own send echo)
+      // 2. This channel is not currently open
+      const isIncoming = msg.senderId !== currentUsername;
+      const isActiveChannel = activeChannelRef.current === msg.channelId;
+
+      if (isIncoming && !isActiveChannel) {
+        setUnreadCounts((prev) => ({
+          ...prev,
+          [msg.channelId]: (prev[msg.channelId] ?? 0) + 1,
+        }));
+      }
     };
 
     newSocket.on("DM_RECEIVED", appendMessage);
@@ -181,6 +199,13 @@ export function SocketProvider({
           createdAt: new Date(m.createdAt),
         })),
       }));
+      // History fetch means this chat was just opened — clear its badge
+      setUnreadCounts((prev) => {
+        if (!prev[channelId]) return prev;
+        const next = { ...prev };
+        next[channelId] = 0;
+        return next;
+      });
     });
 
     newSocket.on("ERROR", ({ message }) => {
@@ -191,7 +216,6 @@ export function SocketProvider({
     newSocket.on("USER_TYPING", ({ channelId, username, isTyping }) => {
       setTypingUsers((prev) => {
         const activeTypers = prev[channelId] ?? [];
-
         if (isTyping) {
           if (activeTypers.includes(username)) return prev;
           return { ...prev, [channelId]: [...activeTypers, username] };
@@ -211,18 +235,16 @@ export function SocketProvider({
       }
       setIsConnected(false);
     };
-  }, [token, currentUsername, onAuthError]); // reconnects only when token or user changes
+  }, [token, currentUsername, onAuthError]);
 
-  // Actions
+  // ─── Actions ──────────────────────────────────────────────────────────────
+
   const sendDM = useCallback((recipientId: string, content: string) => {
     socketRef.current?.emit("SEND_DM", { recipientId, content });
   }, []);
 
   const fetchHistory = useCallback((targetUsername: string) => {
-    socketRef.current?.emit("FETCH_HISTORY", {
-      targetUsername,
-      limit: 50,
-    });
+    socketRef.current?.emit("FETCH_HISTORY", { targetUsername, limit: 50 });
   }, []);
 
   const markRead = useCallback((channelId: string) => {
@@ -236,25 +258,50 @@ export function SocketProvider({
     [],
   );
 
+  // Tell the context which channel is open so DM_RECEIVED skips the unread increment
+  const setActiveChannel = useCallback((channelId: string | null) => {
+    activeChannelRef.current = channelId;
+  }, []);
+
+  // Zero out the badge and notify the server that messages were read
+  const clearUnread = useCallback(
+    (channelId: string) => {
+      setUnreadCounts((prev) => {
+        if (!prev[channelId]) return prev;
+        const next = { ...prev };
+        next[channelId] = 0;
+        return next;
+      });
+      markRead(channelId);
+    },
+    [markRead],
+  );
+
   const value = useMemo(
     () => ({
       isConnected,
       users,
       messages,
-      typingUsers,
+      unreadCounts,
       sendDM,
       fetchHistory,
       markRead,
+      clearUnread,
+      setActiveChannel,
+      typingUsers,
       sendTypingStatus,
     }),
     [
       isConnected,
       users,
       messages,
-      typingUsers,
+      unreadCounts,
       sendDM,
       fetchHistory,
       markRead,
+      clearUnread,
+      setActiveChannel,
+      typingUsers,
       sendTypingStatus,
     ],
   );
@@ -264,7 +311,7 @@ export function SocketProvider({
   );
 }
 
-// ─── Hook
+// ─── Hook ─────────────────────────────────────────────────────────────────────
 
 export function useSocket(): SocketContextValue {
   const ctx = useContext(SocketContext);

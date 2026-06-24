@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import type { AuthUser, AuthState } from "../types/auth";
 
-const BACKEND = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:5001";
+const BACKEND = process.env.NEXT_PUBLIC_BACKEND_URL;
 const TOKEN_KEY = "dm_token";
 const USER_KEY = "dm_user";
 const LOGGED_OUT: AuthState = { token: null, user: null };

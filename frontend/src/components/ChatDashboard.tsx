@@ -46,7 +46,6 @@ function UserAvatar({
   };
   const s = sizes[size];
 
-  // Deterministic pastel hue from username
   const hue =
     username.split("").reduce((acc, ch) => acc + ch.charCodeAt(0), 0) % 360;
 
@@ -86,6 +85,33 @@ function UserAvatar({
   );
 }
 
+// Unread badge
+
+function UnreadBadge({ count }: { count: number }) {
+  if (count === 0) return null;
+  return (
+    <span
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        minWidth: 20,
+        height: 20,
+        padding: "0 6px",
+        borderRadius: 10,
+        backgroundColor: "#6C63FF",
+        color: "#ffffff",
+        fontSize: 11,
+        fontWeight: 700,
+        lineHeight: 1,
+        flexShrink: 0,
+      }}
+    >
+      {count > 99 ? "99+" : count}
+    </span>
+  );
+}
+
 //  Sidebar
 
 function Sidebar({
@@ -95,6 +121,7 @@ function Sidebar({
   onSelectChat,
   messages,
   typingUsers,
+  unreadCounts,
 }: {
   users: PresenceUser[];
   currentUser: string;
@@ -102,6 +129,7 @@ function Sidebar({
   onSelectChat: (username: string) => void;
   messages: Record<string, DMMessage[]>;
   typingUsers: Record<string, string[]>;
+  unreadCounts: Record<string, number>;
 }) {
   const [search, setSearch] = useState("");
 
@@ -226,11 +254,7 @@ function Sidebar({
       </div>
 
       {/* Section label */}
-      <div
-        style={{
-          padding: "12px 20px 6px",
-        }}
-      >
+      <div style={{ padding: "12px 20px 6px" }}>
         <span
           style={{
             fontSize: 11,
@@ -266,6 +290,7 @@ function Sidebar({
             const isPeerTyping = typingUsers[channelId]?.includes(
               user.username,
             );
+            const unread = unreadCounts[channelId] ?? 0;
 
             return (
               <button
@@ -295,44 +320,55 @@ function Sidebar({
                 }}
               >
                 <UserAvatar username={user.username} isOnline={user.isOnline} />
+
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <div
                     style={{
                       display: "flex",
                       justifyContent: "space-between",
                       alignItems: "center",
+                      gap: 6,
                     }}
                   >
                     <span
                       style={{
                         fontSize: 14,
-                        fontWeight: 600,
+                        fontWeight: unread > 0 ? 700 : 600,
                         color: "#1A1A2E",
                         whiteSpace: "nowrap",
                         overflow: "hidden",
                         textOverflow: "ellipsis",
-                        maxWidth: 140,
+                        maxWidth: 110,
                       }}
                     >
                       {user.username}
                     </span>
-                    {lastMsg && !isPeerTyping && (
-                      <span
-                        style={{
-                          fontSize: 11,
-                          color: "#C2C2CE",
-                          flexShrink: 0,
-                        }}
-                      >
-                        {formatMessageTime(lastMsg.createdAt)}
-                      </span>
-                    )}
+                    <div
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 6,
+                        flexShrink: 0,
+                      }}
+                    >
+                      {lastMsg && !isPeerTyping && unread === 0 && (
+                        <span style={{ fontSize: 11, color: "#C2C2CE" }}>
+                          {formatMessageTime(lastMsg.createdAt)}
+                        </span>
+                      )}
+                      <UnreadBadge count={unread} />
+                    </div>
                   </div>
+
                   <p
                     style={{
                       fontSize: 12.5,
-                      color: isPeerTyping ? "#22c55e" : "#9B9BAD",
-                      fontWeight: isPeerTyping ? 500 : 400,
+                      color: isPeerTyping
+                        ? "#22c55e"
+                        : unread > 0
+                          ? "#1A1A2E"
+                          : "#9B9BAD",
+                      fontWeight: isPeerTyping || unread > 0 ? 500 : 400,
                       margin: "2px 0 0",
                       whiteSpace: "nowrap",
                       overflow: "hidden",
@@ -422,7 +458,6 @@ function ChatWindow({
     const trimmed = draft.trim();
     if (!trimmed) return;
 
-    // Clear out typing loops immediately when messaging goes through
     if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
     onTypingStatusChange(false);
     isTypingRef.current = false;
@@ -434,13 +469,11 @@ function ChatWindow({
   const handleInputChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     setDraft(e.target.value);
 
-    // If we haven't flagged typing state yet, fire standard trigger event
     if (!isTypingRef.current) {
       isTypingRef.current = true;
       onTypingStatusChange(true);
     }
 
-    // Bounce checking logic to drop flag if writing goes silent
     if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
     typingTimeoutRef.current = setTimeout(() => {
       onTypingStatusChange(false);
@@ -618,7 +651,7 @@ function ChatWindow({
         <div ref={bottomRef} />
       </div>
 
-      {/* Input container wrapper with localized typing preview */}
+      {/* Input */}
       <div
         style={{
           background: "#FFFFFF",
@@ -800,10 +833,13 @@ export default function ChatDashboard({
   const {
     users,
     messages,
+    unreadCounts,
     typingUsers,
     sendDM,
     fetchHistory,
     markRead,
+    clearUnread,
+    setActiveChannel,
     sendTypingStatus,
   } = useSocket();
   const [activeChat, setActiveChat] = useState<string | null>(null);
@@ -813,6 +849,14 @@ export default function ChatDashboard({
 
   const handleSelectChat = (peerUsername: string) => {
     setActiveChat(peerUsername);
+
+    // Tell the context which channel is now open
+    const channelId = getDMChannelId(currentUser, peerUsername);
+    setActiveChannel(channelId);
+
+    // Clear the unread badge + notify server
+    clearUnread(channelId);
+
     fetchHistory(peerUsername);
   };
 
@@ -842,7 +886,6 @@ export default function ChatDashboard({
     ? users.find((u) => u.username === activeChat)
     : undefined;
 
-  // Determine if the current peer user is typing inside the active channel
   const isPeerTypingInActiveChannel = !!(
     activeChannelId &&
     activeChat &&
@@ -858,6 +901,7 @@ export default function ChatDashboard({
         onSelectChat={handleSelectChat}
         messages={messages}
         typingUsers={typingUsers}
+        unreadCounts={unreadCounts}
       />
       {activeChat ? (
         <ChatWindow
