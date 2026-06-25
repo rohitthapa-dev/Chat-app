@@ -2,21 +2,6 @@
 
 import React, { useState, useCallback } from "react";
 
-// ─── Design tokens (same system as LoginScreen) ───────────────────────────────
-const T = {
-  bg: "#F7F5F2",
-  white: "#FFFFFF",
-  accent: "#6C63FF",
-  accentLight: "#8B83FF",
-  accentTint: "#E8E6FF",
-  textPrimary: "#1A1A2E",
-  textMuted: "#9B9BAD",
-  textSubtle: "#C2C2CE",
-  divider: "#EFEFEF",
-  error: "#EF4444",
-  errorBg: "#FEF2F2",
-};
-
 interface AuthScreenProps {
   onRegister: (username: string, password: string) => Promise<void>;
   onLogin: (username: string, password: string) => Promise<void>;
@@ -100,67 +85,15 @@ export default function AuthScreen({
   );
 
   return (
-    <div
-      style={{
-        minHeight: "100vh",
-        backgroundColor: T.bg,
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        padding: "24px",
-        position: "relative",
-        overflow: "hidden",
-      }}
-    >
+    <div className="min-h-screen bg-[#F7F5F2] flex items-center justify-center p-6 relative overflow-hidden">
       {/* Ambient orb */}
-      <div
-        style={{
-          position: "absolute",
-          top: "50%",
-          left: "50%",
-          transform: "translate(-50%, -60%)",
-          width: "600px",
-          height: "600px",
-          borderRadius: "50%",
-          background: `radial-gradient(circle, ${T.accentTint}80 0%, transparent 70%)`,
-          filter: "blur(40px)",
-          pointerEvents: "none",
-        }}
-      />
+      <div className="absolute top-1/2 left-1/2 -translate-x-1/2 translate-y-[-60%] w-150 h-150 rounded-full pointer-events-none blur-2xl bg-[radial-gradient(circle,#E8E6FF80_0%,transparent_70%)]" />
 
       {/* Card */}
-      <div
-        style={{
-          backgroundColor: T.white,
-          borderRadius: "20px",
-          padding: "40px",
-          width: "100%",
-          maxWidth: "400px",
-          boxShadow:
-            "0 4px 32px rgba(108, 99, 255, 0.08), 0 1px 4px rgba(0,0,0,0.04)",
-          position: "relative",
-          zIndex: 1,
-        }}
-      >
+      <div className="bg-white rounded-[20px] p-10 w-full max-w-100 shadow-[0_4px_32px_rgba(108,99,255,0.08),0_1px_4px_rgba(0,0,0,0.04)] relative z-10">
         {/* Logo mark */}
-        <div
-          style={{
-            display: "flex",
-            justifyContent: "center",
-            marginBottom: "24px",
-          }}
-        >
-          <div
-            style={{
-              width: "48px",
-              height: "48px",
-              borderRadius: "14px",
-              background: `linear-gradient(135deg, ${T.accent}, ${T.accentLight})`,
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-            }}
-          >
+        <div className="flex justify-center mb-6">
+          <div className="w-12 h-12 rounded-[14px] bg-linear-to-br from-[#6C63FF] to-[#8B83FF] flex items-center justify-center">
             <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
               <path
                 d="M20 2H4C2.9 2 2 2.9 2 4V22L6 18H20C21.1 18 22 17.1 22 16V4C22 2.9 21.1 2 20 2Z"
@@ -172,58 +105,26 @@ export default function AuthScreen({
         </div>
 
         {/* Heading */}
-        <h1
-          style={{
-            fontSize: "22px",
-            fontWeight: 700,
-            color: T.textPrimary,
-            textAlign: "center",
-            marginBottom: "4px",
-            letterSpacing: "-0.3px",
-          }}
-        >
+        <h1 className="text-[22px] font-bold text-[#1A1A2E] text-center mb-1 tracking-[-0.3px]">
           {mode === "login" ? "Welcome back" : "Create an account"}
         </h1>
-        <p
-          style={{
-            fontSize: "14px",
-            color: T.textMuted,
-            textAlign: "center",
-            marginBottom: "28px",
-          }}
-        >
+        <p className="text-sm text-[#9B9BAD] text-center mb-7">
           {mode === "login"
             ? "Sign in to continue messaging"
             : "Pick a username and get started"}
         </p>
 
         {/* Mode toggle tabs */}
-        <div
-          style={{
-            display: "flex",
-            backgroundColor: T.bg,
-            borderRadius: "10px",
-            padding: "4px",
-            marginBottom: "24px",
-          }}
-        >
+        <div className="flex bg-[#F7F5F2] rounded-[10px] p-1 mb-6">
           {(["login", "signup"] as Mode[]).map((m) => (
             <button
               key={m}
               onClick={() => switchMode(m)}
-              style={{
-                flex: 1,
-                padding: "8px",
-                borderRadius: "8px",
-                border: "none",
-                cursor: "pointer",
-                fontSize: "14px",
-                fontWeight: mode === m ? 600 : 400,
-                color: mode === m ? T.accent : T.textMuted,
-                backgroundColor: mode === m ? T.white : "transparent",
-                boxShadow: mode === m ? "0 1px 4px rgba(0,0,0,0.06)" : "none",
-                transition: "all 0.15s ease",
-              }}
+              className={`flex-1 p-2 rounded-lg border-none cursor-pointer text-sm transition-all duration-150 ease-in-out ${
+                mode === m
+                  ? "font-semibold text-[#6C63FF] bg-white shadow-[0_1px_4px_rgba(0,0,0,0.06)]"
+                  : "font-normal text-[#9B9BAD] bg-transparent shadow-none"
+              }`}
             >
               {m === "login" ? "Sign in" : "Sign up"}
             </button>
@@ -231,7 +132,7 @@ export default function AuthScreen({
         </div>
 
         {/* Fields */}
-        <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
+        <div className="flex flex-col gap-3">
           <Field
             label="Username"
             type="text"
@@ -263,17 +164,7 @@ export default function AuthScreen({
 
         {/* Error */}
         {error && (
-          <div
-            style={{
-              marginTop: "16px",
-              padding: "10px 14px",
-              backgroundColor: T.errorBg,
-              border: `1px solid ${T.error}22`,
-              borderRadius: "8px",
-              fontSize: "13px",
-              color: T.error,
-            }}
-          >
+          <div className="mt-4 py-2.5 px-3.5 bg-[#FEF2F2] border border-[#EF444422] rounded-lg text-[13px] text-[#EF4444]">
             {error}
           </div>
         )}
@@ -282,22 +173,11 @@ export default function AuthScreen({
         <button
           onClick={handleSubmit}
           disabled={loading}
-          style={{
-            marginTop: "20px",
-            width: "100%",
-            padding: "13px",
-            borderRadius: "12px",
-            border: "none",
-            cursor: loading ? "not-allowed" : "pointer",
-            fontSize: "15px",
-            fontWeight: 600,
-            color: "#FFFFFF",
-            background: loading
-              ? T.textSubtle
-              : `linear-gradient(135deg, ${T.accent}, ${T.accentLight})`,
-            transition: "opacity 0.15s ease",
-            opacity: loading ? 0.7 : 1,
-          }}
+          className={`mt-5 w-full p-3.25 rounded-xl border-none text-[15px] font-semibold text-white transition-opacity duration-150 ${
+            loading
+              ? "cursor-not-allowed bg-[#C2C2CE] opacity-70"
+              : "cursor-pointer bg-linear-to-br from-[#6C63FF] to-[#8B83FF] opacity-100"
+          }`}
         >
           {loading
             ? mode === "login"
@@ -309,26 +189,11 @@ export default function AuthScreen({
         </button>
 
         {/* Connection status */}
-        <p
-          style={{
-            marginTop: "16px",
-            textAlign: "center",
-            fontSize: "12px",
-            color: T.textSubtle,
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            gap: "6px",
-          }}
-        >
+        <p className="mt-4 text-center text-xs text-[#C2C2CE] flex items-center justify-center gap-1.5">
           <span
-            style={{
-              width: "6px",
-              height: "6px",
-              borderRadius: "50%",
-              backgroundColor: isConnected ? "#22c55e" : T.textSubtle,
-              display: "inline-block",
-            }}
+            className={`w-1.5 h-1.5 rounded-full inline-block ${
+              isConnected ? "bg-green-500" : "bg-[#C2C2CE]"
+            }`}
           />
           {isConnected ? "Server connected" : "Connecting to server…"}
         </p>
@@ -361,15 +226,7 @@ function Field({
 
   return (
     <div>
-      <label
-        style={{
-          display: "block",
-          fontSize: "13px",
-          fontWeight: 500,
-          color: "#1A1A2E",
-          marginBottom: "6px",
-        }}
-      >
+      <label className="block text-[13px] font-medium text-[#1A1A2E] mb-1.5">
         {label}
       </label>
       <input
@@ -381,18 +238,9 @@ function Field({
         onKeyDown={onKeyDown}
         onFocus={() => setFocused(true)}
         onBlur={() => setFocused(false)}
-        style={{
-          width: "100%",
-          padding: "11px 14px",
-          borderRadius: "10px",
-          border: `1.5px solid ${focused ? "#6C63FF" : "#EFEFEF"}`,
-          backgroundColor: "#F7F5F2",
-          fontSize: "14px",
-          color: "#1A1A2E",
-          outline: "none",
-          transition: "border-color 0.15s ease",
-          boxSizing: "border-box",
-        }}
+        className={`w-full py-2.75 px-3.5 rounded-[10px] border-[1.5px] bg-[#F7F5F2] text-sm text-[#1A1A2E] outline-none transition-colors box-border ${
+          focused ? "border-[#6C63FF]" : "border-[#EFEFEF]"
+        }`}
       />
     </div>
   );
