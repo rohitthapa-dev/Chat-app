@@ -5,7 +5,8 @@ import cors from "cors";
 import { Server, Socket } from "socket.io";
 import connectDB from "./config/db.js";
 import User from "./models/User.js";
-import Message, { getDMChannelId } from "./models/Message.js";
+import Room from "./models/Room.js";
+import Message from "./models/Message.js";
 import authRouter from "./routes/auth.js";
 import { verifyToken, type JWTPayload } from "./config/jwt.js";
 
@@ -14,30 +15,32 @@ interface ServerToClientEvents {
   USER_ONLINE: (payload: { username: string }) => void;
   USER_OFFLINE: (payload: { username: string; lastSeen: Date }) => void;
   PRESENCE_SNAPSHOT: (users: PresenceUser[]) => void;
-  DM_RECEIVED: (message: SerializedMessage) => void;
-  DM_HISTORY: (messages: SerializedMessage[]) => void;
+  MESSAGE_RECEIVED: (message: SerializedMessage) => void;
+  MESSAGE_HISTORY: (messages: SerializedMessage[]) => void;
+  NOTIFY_ROOM_CREATED: (room: SerializedRoom) => void;
   ERROR: (payload: { message: string }) => void;
   USER_TYPING: (payload: {
-    channelId: string;
+    roomId: string;
     username: string;
     isTyping: boolean;
   }) => void;
 }
 
 interface ClientToServerEvents {
-  SEND_DM: (payload: SendDMPayload) => void;
+  SEND_MESSAGE: (payload: SendMessagePayload) => void;
   FETCH_HISTORY: (payload: FetchHistoryPayload) => void;
-  MARK_READ: (payload: { channelId: string }) => void;
-  TYPING_STATUS: (payload: { recipientId: string; isTyping: boolean }) => void;
+  MARK_READ: (payload: { roomId: string }) => void;
+  TYPING_STATUS: (payload: { roomId: string; isTyping: boolean }) => void;
+  NOTIFY_ROOM_CREATED: (room: SerializedRoom) => void;
 }
 
-interface SendDMPayload {
-  recipientId: string;
+interface SendMessagePayload {
+  roomId: string;
   content: string;
 }
 
 interface FetchHistoryPayload {
-  targetUsername: string;
+  roomId: string;
   limit?: number;
   before?: string;
 }
@@ -50,25 +53,28 @@ interface PresenceUser {
 
 interface SerializedMessage {
   _id: string;
+  roomId: string;
   senderId: string;
-  recipientId: string;
-  channelId: string;
   content: string;
-  read: boolean;
+  readBy: string[];
   createdAt: Date;
+}
+
+interface SerializedRoom {
+  _id: string;
+  type: "direct" | "group";
+  name?: string;
+  members: string[];
+  admins: string[];
+  createdAt: Date;
+  updatedAt: Date;
 }
 
 interface SocketData {
   user: JWTPayload; // { userId, username }
 }
 
-//  Maps: socket ↔ username
-
-const socketToUser = new Map<string, string>();
-const userToSocket = new Map<string, string>();
-
-//  App Setup
-
+// App Setup
 await connectDB();
 
 const app = express();
@@ -89,18 +95,19 @@ const io = new Server<
   },
 });
 
-//  REST: Health
-
+// REST: Health
 app.get("/health", (_req, res) => {
   res.json({ status: "ok", timestamp: new Date().toISOString() });
 });
 
 // REST: Auth
-
 app.use("/api/auth", authRouter);
 
-//  REST: All Users
+// REST: Chat Routes
+import chatRouter from "./routes/chatRoutes.js";
+app.use("/api/chat", chatRouter);
 
+// REST: All Users
 app.get("/api/users", async (_req, res) => {
   try {
     const users = await User.find(
@@ -114,28 +121,22 @@ app.get("/api/users", async (_req, res) => {
 });
 
 // Socket.IO: Auth Middleware
-
 io.use((socket, next) => {
   const token = socket.handshake.auth?.token as string | undefined;
-
-  if (!token) {
-    return next(new Error("AUTH_REQUIRED"));
-  }
+  if (!token) return next(new Error("AUTH_REQUIRED"));
 
   try {
     const payload = verifyToken(token);
     socket.data.user = payload;
     next();
   } catch (err: any) {
-    if (err.name === "TokenExpiredError") {
+    if (err.name === "TokenExpiredError")
       return next(new Error("TOKEN_EXPIRED"));
-    }
     return next(new Error("INVALID_TOKEN"));
   }
 });
 
 // Socket.IO: Core Event Loop
-
 io.on(
   "connection",
   async (
@@ -147,84 +148,119 @@ io.on(
     >,
   ) => {
     const { userId, username } = socket.data.user;
-
     console.log(`🔌 Socket connected: ${username} (${socket.id})`);
 
-    socketToUser.set(socket.id, username);
-    userToSocket.set(username, socket.id);
+    // Keep personal room for presence/direct user targeting
     void socket.join(username);
 
     try {
-      // Step 1: mark this user online — MUST be awaited first
+      // 1. Mark user online
       await User.findByIdAndUpdate(userId, {
         isOnline: true,
         lastSeen: new Date(),
       });
 
-      // Step 2: fetch snapshot AFTER the write is committed
-      // so this user appears as online in their own sidebar too
+      // 2. Send presence snapshot to user
       const allUsers = await User.find(
         {},
         { username: 1, isOnline: 1, lastSeen: 1, _id: 0 },
       );
       socket.emit("PRESENCE_SNAPSHOT", allUsers as PresenceUser[]);
 
-      // Step 3: tell everyone else this user is online
+      // 3. Broadcast user online
       socket.broadcast.emit("USER_ONLINE", { username });
+
+      // 4. UNIFIED ROOMS: Join user to all their Room documents
+      const userRooms = await Room.find({ members: username }).select("_id");
+      userRooms.forEach((room) => {
+        void socket.join(room._id.toString());
+      });
+      console.log(` Joined ${userRooms.length} rooms for ${username}`);
     } catch (err) {
       console.error("Connection setup error:", err);
     }
 
-    // ── SEND_DM
-    socket.on("SEND_DM", async ({ recipientId, content }: SendDMPayload) => {
-      if (!recipientId || !content?.trim()) {
-        socket.emit("ERROR", { message: "Invalid message payload." });
-        return;
-      }
-
-      if (username === recipientId.toLowerCase()) {
-        socket.emit("ERROR", { message: "Cannot send a DM to yourself." });
-        return;
-      }
-
-      const channelId = getDMChannelId(username, recipientId);
-
+    // ── NOTIFY_ROOM_CREATED
+    socket.on("NOTIFY_ROOM_CREATED", async (room: SerializedRoom) => {
       try {
-        const saved = await Message.create({
-          senderId: username,
-          recipientId: recipientId.toLowerCase(),
-          channelId,
-          content: content.trim(),
-          read: false,
+        // Join all active sockets of the members to this new room
+        for (const member of room.members) {
+          const memberSockets = await io.in(member).fetchSockets();
+          memberSockets.forEach((s) => s.join(room._id));
+        }
+
+        // Notify all members to update their sidebar
+        room.members.forEach((member) => {
+          io.to(member).emit("NOTIFY_ROOM_CREATED", room);
         });
-
-        const serialized: SerializedMessage = {
-          _id: String(saved._id),
-          senderId: saved.senderId,
-          recipientId: saved.recipientId,
-          channelId: saved.channelId,
-          content: saved.content,
-          read: saved.read,
-          createdAt: saved.createdAt,
-        };
-
-        socket.emit("DM_RECEIVED", serialized);
-        io.to(recipientId.toLowerCase()).emit("DM_RECEIVED", serialized);
       } catch (err) {
-        console.error("SEND_DM error:", err);
-        socket.emit("ERROR", { message: "Message delivery failed." });
+        console.error("NOTIFY_ROOM_CREATED error:", err);
       }
     });
+
+    // ── SEND_MESSAGE
+    socket.on(
+      "SEND_MESSAGE",
+      async ({ roomId, content }: SendMessagePayload) => {
+        if (!roomId || !content?.trim()) {
+          socket.emit("ERROR", { message: "Invalid message payload." });
+          return;
+        }
+
+        try {
+          // 1. Verify sender is a member of the room
+          const room = await Room.findById(roomId);
+          if (!room || !room.members.includes(username)) {
+            socket.emit("ERROR", { message: "Access denied to this room." });
+            return;
+          }
+
+          // 2. Ensure sockets are dynamically joined to the room!
+
+          await socket.join(roomId);
+          if (room.type === "direct") {
+            const recipient = room.members.find((m) => m !== username);
+            if (recipient) {
+              // Fetch any active sockets for the recipient and join them to the room
+              const recipientSockets = await io.in(recipient).fetchSockets();
+              recipientSockets.forEach((s) => s.join(roomId));
+            }
+          }
+
+          // 3. Save the message
+          const saved = await Message.create({
+            roomId: room._id,
+            senderId: username,
+            content: content.trim(),
+            readBy: [username], // Sender has obviously read it
+          });
+
+          const serialized: SerializedMessage = {
+            _id: String(saved._id),
+            roomId: String(saved.roomId),
+            senderId: saved.senderId,
+            content: saved.content,
+            readBy: saved.readBy,
+            createdAt: saved.createdAt,
+          };
+
+          // 4. Emit to everyone in the room (including sender for UI confirmation)
+          io.to(roomId).emit("MESSAGE_RECEIVED", serialized);
+        } catch (err) {
+          console.error("SEND_MESSAGE error:", err);
+          socket.emit("ERROR", { message: "Message delivery failed." });
+        }
+      },
+    );
 
     // ── FETCH_HISTORY
     socket.on(
       "FETCH_HISTORY",
-      async ({ targetUsername, limit = 50, before }: FetchHistoryPayload) => {
-        const channelId = getDMChannelId(username, targetUsername);
+      async ({ roomId, limit = 50, before }: FetchHistoryPayload) => {
+        if (!roomId) return;
 
         try {
-          const query: Record<string, unknown> = { channelId };
-
+          const query: Record<string, unknown> = { roomId };
           if (before) {
             query["createdAt"] = { $lt: new Date(before) };
           }
@@ -236,15 +272,14 @@ io.on(
 
           const serialized: SerializedMessage[] = messages.map((m) => ({
             _id: String(m._id),
+            roomId: String(m.roomId),
             senderId: m.senderId,
-            recipientId: m.recipientId,
-            channelId: m.channelId,
             content: m.content,
-            read: m.read,
+            readBy: m.readBy,
             createdAt: m.createdAt,
           }));
 
-          socket.emit("DM_HISTORY", serialized);
+          socket.emit("MESSAGE_HISTORY", serialized);
         } catch (err) {
           console.error("FETCH_HISTORY error:", err);
           socket.emit("ERROR", { message: "Could not load message history." });
@@ -253,11 +288,13 @@ io.on(
     );
 
     // ── MARK_READ
-    socket.on("MARK_READ", async ({ channelId }: { channelId: string }) => {
+    socket.on("MARK_READ", async ({ roomId }: { roomId: string }) => {
+      if (!roomId) return;
       try {
+        // Add user to readBy array for all messages in room they haven't read
         await Message.updateMany(
-          { channelId, recipientId: username, read: false },
-          { read: true },
+          { roomId, readBy: { $ne: username } },
+          { $addToSet: { readBy: username } },
         );
       } catch (err) {
         console.error("MARK_READ error:", err);
@@ -265,33 +302,25 @@ io.on(
     });
 
     // ── TYPING_STATUS
-    socket.on("TYPING_STATUS", ({ recipientId, isTyping }) => {
-      if (!recipientId) return;
+    socket.on("TYPING_STATUS", ({ roomId, isTyping }) => {
+      if (!roomId) return;
 
-      const targetRoom = recipientId.toLowerCase();
-      const channelId = getDMChannelId(username, targetRoom);
-
-      // Forward typing status to the recipient's personal socket room
-      io.to(targetRoom).emit("USER_TYPING", {
-        channelId,
-        username, // The person who is typing
+      // Broadcast to everyone else in the room
+      socket.to(roomId).emit("USER_TYPING", {
+        roomId,
+        username,
         isTyping,
       });
     });
 
     // DISCONNECT
     socket.on("disconnect", async () => {
-      socketToUser.delete(socket.id);
-      userToSocket.delete(username);
-
       const lastSeen = new Date();
-
       try {
         await User.findByIdAndUpdate(userId, { isOnline: false, lastSeen });
       } catch (err) {
         console.error("Presence cleanup error:", err);
       }
-
       io.emit("USER_OFFLINE", { username, lastSeen });
       console.log(`👋 Disconnected: ${username} (${socket.id})`);
     });
@@ -300,7 +329,6 @@ io.on(
 
 // Start
 const PORT = Number(process.env.PORT) || 5001;
-
 httpServer.listen(PORT, () => {
   console.log(`🚀 Server running on http://localhost:${PORT}`);
 });
