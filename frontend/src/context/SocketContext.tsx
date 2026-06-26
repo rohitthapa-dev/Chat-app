@@ -46,6 +46,7 @@ interface ServerToClientEvents {
   MESSAGE_RECEIVED: (message: ChatMessage) => void;
   MESSAGE_HISTORY: (messages: ChatMessage[]) => void;
   NOTIFY_ROOM_CREATED: (room: Room) => void;
+  NOTIFY_ROOM_UPDATED: (room: Room) => void;
   ERROR: (payload: { message: string }) => void;
   USER_TYPING: (payload: {
     roomId: string;
@@ -60,6 +61,7 @@ interface ClientToServerEvents {
   MARK_READ: (payload: { roomId: string }) => void;
   TYPING_STATUS: (payload: { roomId: string; isTyping: boolean }) => void;
   NOTIFY_ROOM_CREATED: (room: Room) => void;
+  NOTIFY_ROOM_UPDATED: (room: Room) => void;
 }
 
 // ─── Context Definition ───────────────────────────────────────────────────────
@@ -79,6 +81,8 @@ interface SocketContextValue {
   sendTypingStatus: (roomId: string, isTyping: boolean) => void;
   createDMRoom: (recipientId: string) => Promise<Room | null>;
   createGroupRoom: (name: string, members: string[]) => Promise<Room | null>;
+  addMember: (roomId: string, username: string) => Promise<Room | null>;
+  removeMember: (roomId: string, username: string) => Promise<Room | null>;
 }
 
 const SocketContext = createContext<SocketContextValue | null>(null);
@@ -250,6 +254,13 @@ export function SocketProvider({
       });
     });
 
+    // Listen for room updates (members added/removed)
+    newSocket.on("NOTIFY_ROOM_UPDATED", (updatedRoom) => {
+      setRooms((prev) =>
+        prev.map((r) => (r._id === updatedRoom._id ? updatedRoom : r)),
+      );
+    });
+
     return () => {
       newSocket.disconnect();
       if (socketRef.current === newSocket) socketRef.current = null;
@@ -354,6 +365,70 @@ export function SocketProvider({
     [token],
   );
 
+  const addMember = useCallback(
+    async (roomId: string, username: string): Promise<Room | null> => {
+      if (!token) return null;
+      try {
+        const res = await fetch(
+          `${process.env.NEXT_PUBLIC_BACKEND_URL}/api/chat/rooms/${roomId}/members`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${token}`,
+            },
+            body: JSON.stringify({ username }),
+          },
+        );
+        if (res.ok) {
+          const updatedRoom: Room = await res.json();
+          setRooms((prev) =>
+            prev.map((r) => (r._id === updatedRoom._id ? updatedRoom : r)),
+          );
+          socketRef.current?.emit("NOTIFY_ROOM_UPDATED", updatedRoom);
+          return updatedRoom;
+        }
+        return null;
+      } catch (err) {
+        console.error("Failed to add member", err);
+        return null;
+      }
+    },
+    [token],
+  );
+
+  const removeMember = useCallback(
+    async (roomId: string, username: string): Promise<Room | null> => {
+      if (!token) return null;
+      try {
+        const res = await fetch(
+          `${process.env.NEXT_PUBLIC_BACKEND_URL}/api/chat/rooms/${roomId}/members`,
+          {
+            method: "DELETE",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${token}`,
+            },
+            body: JSON.stringify({ username }),
+          },
+        );
+        if (res.ok) {
+          const updatedRoom: Room = await res.json();
+          setRooms((prev) =>
+            prev.map((r) => (r._id === updatedRoom._id ? updatedRoom : r)),
+          );
+          socketRef.current?.emit("NOTIFY_ROOM_UPDATED", updatedRoom);
+          return updatedRoom;
+        }
+        return null;
+      } catch (err) {
+        console.error("Failed to remove member", err);
+        return null;
+      }
+    },
+    [token],
+  );
+
   const value = useMemo(
     () => ({
       isConnected,
@@ -370,6 +445,8 @@ export function SocketProvider({
       sendTypingStatus,
       createDMRoom,
       createGroupRoom,
+      addMember,
+      removeMember,
     }),
     [
       isConnected,
@@ -386,6 +463,8 @@ export function SocketProvider({
       sendTypingStatus,
       createDMRoom,
       createGroupRoom,
+      addMember,
+      removeMember,
     ],
   );
 
