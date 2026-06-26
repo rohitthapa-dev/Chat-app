@@ -89,3 +89,47 @@ export async function createGroupRoom(req: AuthRequest, res: Response) {
     res.status(500).json({ error: "Failed to create group" });
   }
 }
+
+export async function addMember(req: AuthRequest, res: Response) {
+  try {
+    if (!req.user) return res.status(401).json({ error: "Not authenticated" });
+    const { roomId } = req.params;
+    const { username } = req.body;
+    const currentUsername = req.user.username;
+
+    const room = await Room.findById(roomId);
+    if (!room) return res.status(404).json({ error: "Room not found" });
+    if (!room.admins.includes(currentUsername))
+      return res.status(403).json({ error: "Only admins can add members" });
+    if (room.members.includes(username))
+      return res.status(400).json({ error: "User already in group" });
+
+    room.members.push(username);
+    await room.save();
+    res.status(200).json(room);
+  } catch (error) {
+    res.status(500).json({ error: "Failed to add member" });
+  }
+}
+
+export async function removeMember(req: AuthRequest, res: Response) {
+  try {
+    if (!req.user) return res.status(401).json({ error: "Not authenticated" });
+    const { roomId } = req.params;
+    const { username } = req.body;
+    const currentUsername = req.user.username;
+
+    const room = await Room.findById(roomId);
+    if (!room) return res.status(404).json({ error: "Room not found" });
+    if (!room.admins.includes(currentUsername))
+      return res.status(403).json({ error: "Only admins can remove members" });
+    if (room.admins.includes(username))
+      return res.status(400).json({ error: "Cannot remove an admin" });
+
+    room.members = room.members.filter((m) => m !== username);
+    await room.save();
+    res.status(200).json(room);
+  } catch (error) {
+    res.status(500).json({ error: "Failed to remove member" });
+  }
+}
