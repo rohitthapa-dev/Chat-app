@@ -18,6 +18,7 @@ interface ServerToClientEvents {
   MESSAGE_RECEIVED: (message: SerializedMessage) => void;
   MESSAGE_HISTORY: (messages: SerializedMessage[]) => void;
   NOTIFY_ROOM_CREATED: (room: SerializedRoom) => void;
+  NOTIFY_ROOM_UPDATED: (room: SerializedRoom) => void;
   ERROR: (payload: { message: string }) => void;
   USER_TYPING: (payload: {
     roomId: string;
@@ -32,6 +33,7 @@ interface ClientToServerEvents {
   MARK_READ: (payload: { roomId: string }) => void;
   TYPING_STATUS: (payload: { roomId: string; isTyping: boolean }) => void;
   NOTIFY_ROOM_CREATED: (room: SerializedRoom) => void;
+  NOTIFY_ROOM_UPDATED: (room: SerializedRoom) => void;
 }
 
 interface SendMessagePayload {
@@ -198,6 +200,24 @@ io.on(
       }
     });
 
+    // ── NOTIFY_ROOM_UPDATED
+    socket.on("NOTIFY_ROOM_UPDATED", async (room: SerializedRoom) => {
+      try {
+        // Ensure sockets are dynamically joined to the room (handles newly added members)
+        for (const member of room.members) {
+          const memberSockets = await io.in(member).fetchSockets();
+          memberSockets.forEach((s) => s.join(room._id));
+        }
+
+        // Notify all members to update their sidebar and group info
+        room.members.forEach((member) => {
+          io.to(member).emit("NOTIFY_ROOM_UPDATED", room);
+        });
+      } catch (err) {
+        console.error("NOTIFY_ROOM_UPDATED error:", err);
+      }
+    });
+
     // ── SEND_MESSAGE
     socket.on(
       "SEND_MESSAGE",
@@ -216,7 +236,7 @@ io.on(
           }
 
           // 2. Ensure sockets are dynamically joined to the room!
-
+          // This fixes the issue where a room was created via REST but sockets haven't joined it yet.
           await socket.join(roomId);
           if (room.type === "direct") {
             const recipient = room.members.find((m) => m !== username);
