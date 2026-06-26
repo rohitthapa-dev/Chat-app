@@ -53,6 +53,8 @@ interface ServerToClientEvents {
     username: string;
     isTyping: boolean;
   }) => void;
+  // Emitted by server after MARK_READ — tells the sender their message was seen
+  MESSAGES_READ: (payload: { roomId: string; reader: string }) => void;
 }
 
 interface ClientToServerEvents {
@@ -115,14 +117,13 @@ export function SocketProvider({
 
   const activeRoomRef = useRef<string | null>(null);
 
+  // ── Fetch rooms from REST (called on every connect/reconnect)
   const fetchRooms = useCallback(async () => {
     if (!token) return;
     try {
       const res = await fetch(
         `${process.env.NEXT_PUBLIC_BACKEND_URL}/api/chat/rooms`,
-        {
-          headers: { Authorization: `Bearer ${token}` },
-        },
+        { headers: { Authorization: `Bearer ${token}` } },
       );
       if (res.ok) {
         const data = await res.json();
@@ -133,20 +134,47 @@ export function SocketProvider({
     }
   }, [token]);
 
+  // ── Fetch all users for presence sync (called on every connect/reconnect)
+  const fetchUsers = useCallback(async () => {
+    if (!token) return;
+    try {
+      const res = await fetch(
+        `${process.env.NEXT_PUBLIC_BACKEND_URL}/api/users`,
+        { headers: { Authorization: `Bearer ${token}` } },
+      );
+      if (res.ok) {
+        const data: PresenceUser[] = await res.json();
+        setUsers(data.map((u) => ({ ...u, lastSeen: new Date(u.lastSeen) })));
+      }
+    } catch (err) {
+      console.error("Failed to fetch users", err);
+    }
+  }, [token]);
+
   useEffect(() => {
     if (!token || !currentUsername) return;
 
     const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL;
     const newSocket: Socket<ServerToClientEvents, ClientToServerEvents> = io(
       backendUrl,
-      { auth: { token }, reconnectionAttempts: 5 },
+      {
+        auth: { token },
+        reconnectionAttempts: 5,
+        // Slightly longer reconnection delay so server has time to clean up
+        reconnectionDelay: 1000,
+      },
     );
 
     socketRef.current = newSocket;
 
+    // ── connect fires on first connection AND every reconnect
     newSocket.on("connect", () => {
       setIsConnected(true);
-      fetchRooms();
+      // Re-sync both rooms and presence on every (re)connect.
+      // This is what was missing — previously only fetchRooms was called,
+      // leaving presence state stale after a reconnect.
+      void fetchRooms();
+      void fetchUsers();
     });
 
     newSocket.on("disconnect", () => {
@@ -165,6 +193,8 @@ export function SocketProvider({
       }
     });
 
+    // PRESENCE_SNAPSHOT is still useful as the authoritative server-side view.
+    // It arrives right after connect and overrides any stale REST data.
     newSocket.on("PRESENCE_SNAPSHOT", (snapshot) => {
       setUsers(snapshot.map((u) => ({ ...u, lastSeen: new Date(u.lastSeen) })));
     });
@@ -172,10 +202,11 @@ export function SocketProvider({
     newSocket.on("USER_ONLINE", ({ username }) => {
       setUsers((prev) => {
         const exists = prev.find((u) => u.username === username);
-        if (exists)
+        if (exists) {
           return prev.map((u) =>
             u.username === username ? { ...u, isOnline: true } : u,
           );
+        }
         return [...prev, { username, isOnline: true, lastSeen: new Date() }];
       });
     });
@@ -246,7 +277,6 @@ export function SocketProvider({
       });
     });
 
-    // Listen for new rooms (groups or DMs) created by other users
     newSocket.on("NOTIFY_ROOM_CREATED", (room) => {
       setRooms((prev) => {
         if (prev.find((r) => r._id === room._id)) return prev;
@@ -254,11 +284,27 @@ export function SocketProvider({
       });
     });
 
-    // Listen for room updates (members added/removed)
     newSocket.on("NOTIFY_ROOM_UPDATED", (updatedRoom) => {
       setRooms((prev) =>
         prev.map((r) => (r._id === updatedRoom._id ? updatedRoom : r)),
       );
+    });
+
+    // When the recipient reads messages, update readBy in local state so
+    // the sender sees "Seen" instantly without needing a refresh or re-fetch.
+    newSocket.on("MESSAGES_READ", ({ roomId, reader }) => {
+      setMessages((prev) => {
+        const roomMessages = prev[roomId];
+        if (!roomMessages) return prev;
+        return {
+          ...prev,
+          [roomId]: roomMessages.map((msg) =>
+            msg.readBy.includes(reader)
+              ? msg
+              : { ...msg, readBy: [...msg.readBy, reader] },
+          ),
+        };
+      });
     });
 
     return () => {
@@ -266,7 +312,7 @@ export function SocketProvider({
       if (socketRef.current === newSocket) socketRef.current = null;
       setIsConnected(false);
     };
-  }, [token, currentUsername, onAuthError, fetchRooms]);
+  }, [token, currentUsername, onAuthError, fetchRooms, fetchUsers]);
 
   const sendMessage = useCallback((roomId: string, content: string) => {
     socketRef.current?.emit("SEND_MESSAGE", { roomId, content });
@@ -320,11 +366,14 @@ export function SocketProvider({
             if (prev.find((r) => r._id === newRoom._id)) return prev;
             return [newRoom, ...prev];
           });
+          // Fix: emit NOTIFY_ROOM_CREATED for DMs too, so the recipient's
+          // sidebar updates in real-time without a refresh.
+          socketRef.current?.emit("NOTIFY_ROOM_CREATED", newRoom);
           return newRoom;
         }
         return null;
       } catch (err) {
-        console.error("Failed to create room", err);
+        console.error("Failed to create DM room", err);
         return null;
       }
     },
@@ -352,7 +401,6 @@ export function SocketProvider({
             if (prev.find((r) => r._id === newRoom._id)) return prev;
             return [newRoom, ...prev];
           });
-          // Tell server to connect everyone via sockets
           socketRef.current?.emit("NOTIFY_ROOM_CREATED", newRoom);
           return newRoom;
         }
