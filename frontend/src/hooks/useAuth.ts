@@ -42,10 +42,16 @@ function readStorage(): AuthState {
 
 export function useAuth() {
   const [auth, setAuth] = useState<AuthState>(LOGGED_OUT);
+  // Track whether we've finished reading from localStorage.
+  // SocketProvider should only mount once this is true so it always
+  // gets the real token on first render, not null.
+  const [isReady, setIsReady] = useState(false);
 
   useEffect(() => {
+    // setTimeout 0 defers past SSR hydration so localStorage is safe to read.
     const id = window.setTimeout(() => {
       setAuth(readStorage());
+      setIsReady(true);
     }, 0);
 
     return () => window.clearTimeout(id);
@@ -97,6 +103,7 @@ export function useAuth() {
     token: auth.token,
     user: auth.user,
     isAuthenticated: !!auth.token && !!auth.user,
+    isReady,
     register,
     login,
     logout,

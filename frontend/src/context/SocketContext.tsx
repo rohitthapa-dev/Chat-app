@@ -20,56 +20,71 @@ export interface PresenceUser {
   lastSeen: Date;
 }
 
-export interface DMMessage {
+export interface ChatMessage {
   _id: string;
+  roomId: string;
   senderId: string;
-  recipientId: string;
-  channelId: string;
   content: string;
-  read: boolean;
+  readBy: string[];
   createdAt: Date;
+}
+
+export interface Room {
+  _id: string;
+  type: "direct" | "group";
+  name?: string;
+  members: string[];
+  admins: string[];
+  createdAt: Date;
+  updatedAt: Date;
 }
 
 interface ServerToClientEvents {
   USER_ONLINE: (payload: { username: string }) => void;
   USER_OFFLINE: (payload: { username: string; lastSeen: Date }) => void;
   PRESENCE_SNAPSHOT: (users: PresenceUser[]) => void;
-  DM_RECEIVED: (message: DMMessage) => void;
-  DM_HISTORY: (messages: DMMessage[]) => void;
+  MESSAGE_RECEIVED: (message: ChatMessage) => void;
+  MESSAGE_HISTORY: (messages: ChatMessage[]) => void;
+  NOTIFY_ROOM_CREATED: (room: Room) => void;
+  NOTIFY_ROOM_UPDATED: (room: Room) => void;
   ERROR: (payload: { message: string }) => void;
   USER_TYPING: (payload: {
-    channelId: string;
+    roomId: string;
     username: string;
     isTyping: boolean;
   }) => void;
+  // Emitted by server after MARK_READ — tells the sender their message was seen
+  MESSAGES_READ: (payload: { roomId: string; reader: string }) => void;
 }
 
 interface ClientToServerEvents {
-  SEND_DM: (payload: { recipientId: string; content: string }) => void;
-  FETCH_HISTORY: (payload: { targetUsername: string; limit?: number }) => void;
-  MARK_READ: (payload: { channelId: string }) => void;
-  TYPING_STATUS: (payload: { recipientId: string; isTyping: boolean }) => void;
+  SEND_MESSAGE: (payload: { roomId: string; content: string }) => void;
+  FETCH_HISTORY: (payload: { roomId: string; limit?: number }) => void;
+  MARK_READ: (payload: { roomId: string }) => void;
+  TYPING_STATUS: (payload: { roomId: string; isTyping: boolean }) => void;
+  NOTIFY_ROOM_CREATED: (room: Room) => void;
+  NOTIFY_ROOM_UPDATED: (room: Room) => void;
 }
-
-// ─── Shared utility: deterministic channel ID ─────────────────────────────────
-
-export const getDMChannelId = (userA: string, userB: string): string =>
-  [userA.toLowerCase(), userB.toLowerCase()].sort().join("_");
 
 // ─── Context Definition ───────────────────────────────────────────────────────
 
 interface SocketContextValue {
   isConnected: boolean;
   users: PresenceUser[];
-  messages: Record<string, DMMessage[]>;
+  rooms: Room[];
+  messages: Record<string, ChatMessage[]>;
   unreadCounts: Record<string, number>;
-  sendDM: (recipientId: string, content: string) => void;
-  fetchHistory: (targetUsername: string) => void;
-  markRead: (channelId: string) => void;
-  clearUnread: (channelId: string) => void;
-  setActiveChannel: (channelId: string | null) => void;
+  sendMessage: (roomId: string, content: string) => void;
+  fetchHistory: (roomId: string) => void;
+  markRead: (roomId: string) => void;
+  clearUnread: (roomId: string) => void;
+  setActiveRoom: (roomId: string | null) => void;
   typingUsers: Record<string, string[]>;
-  sendTypingStatus: (recipientId: string, isTyping: boolean) => void;
+  sendTypingStatus: (roomId: string, isTyping: boolean) => void;
+  createDMRoom: (recipientId: string) => Promise<Room | null>;
+  createGroupRoom: (name: string, members: string[]) => Promise<Room | null>;
+  addMember: (roomId: string, username: string) => Promise<Room | null>;
+  removeMember: (roomId: string, username: string) => Promise<Room | null>;
 }
 
 const SocketContext = createContext<SocketContextValue | null>(null);
@@ -95,31 +110,73 @@ export function SocketProvider({
   > | null>(null);
   const [isConnected, setIsConnected] = useState(false);
   const [users, setUsers] = useState<PresenceUser[]>([]);
-  const [messages, setMessages] = useState<Record<string, DMMessage[]>>({});
+  const [rooms, setRooms] = useState<Room[]>([]);
+  const [messages, setMessages] = useState<Record<string, ChatMessage[]>>({});
   const [typingUsers, setTypingUsers] = useState<Record<string, string[]>>({});
   const [unreadCounts, setUnreadCounts] = useState<Record<string, number>>({});
 
-  // Ref so DM_RECEIVED always reads the latest active channel
-  // without needing the effect to be recreated on every channel switch.
-  const activeChannelRef = useRef<string | null>(null);
+  const activeRoomRef = useRef<string | null>(null);
+
+  // ── Fetch rooms from REST (called on every connect/reconnect)
+  const fetchRooms = useCallback(async () => {
+    if (!token) return;
+    try {
+      const res = await fetch(
+        `${process.env.NEXT_PUBLIC_BACKEND_URL}/api/chat/rooms`,
+        { headers: { Authorization: `Bearer ${token}` } },
+      );
+      if (res.ok) {
+        const data = await res.json();
+        setRooms(data);
+      }
+    } catch (err) {
+      console.error("Failed to fetch rooms", err);
+    }
+  }, [token]);
+
+  // ── Fetch all users for presence sync (called on every connect/reconnect)
+  const fetchUsers = useCallback(async () => {
+    if (!token) return;
+    try {
+      const res = await fetch(
+        `${process.env.NEXT_PUBLIC_BACKEND_URL}/api/users`,
+        { headers: { Authorization: `Bearer ${token}` } },
+      );
+      if (res.ok) {
+        const data: PresenceUser[] = await res.json();
+        setUsers(data.map((u) => ({ ...u, lastSeen: new Date(u.lastSeen) })));
+      }
+    } catch (err) {
+      console.error("Failed to fetch users", err);
+    }
+  }, [token]);
 
   useEffect(() => {
     if (!token || !currentUsername) return;
 
     const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL;
-
     const newSocket: Socket<ServerToClientEvents, ClientToServerEvents> = io(
       backendUrl,
       {
         auth: { token },
         reconnectionAttempts: 5,
+        // Slightly longer reconnection delay so server has time to clean up
+        reconnectionDelay: 1000,
       },
     );
 
     socketRef.current = newSocket;
 
-    // ── Connection lifecycle ───────────────────────────────────────────────
-    newSocket.on("connect", () => setIsConnected(true));
+    // ── connect fires on first connection AND every reconnect
+    newSocket.on("connect", () => {
+      setIsConnected(true);
+      // Re-sync both rooms and presence on every (re)connect.
+      // This is what was missing — previously only fetchRooms was called,
+      // leaving presence state stale after a reconnect.
+      void fetchRooms();
+      void fetchUsers();
+    });
+
     newSocket.on("disconnect", () => {
       setIsConnected(false);
       setTypingUsers({});
@@ -127,16 +184,17 @@ export function SocketProvider({
 
     newSocket.on("connect_error", (err) => {
       if (
-        err.message === "AUTH_REQUIRED" ||
-        err.message === "INVALID_TOKEN" ||
-        err.message === "TOKEN_EXPIRED"
+        ["AUTH_REQUIRED", "INVALID_TOKEN", "TOKEN_EXPIRED"].includes(
+          err.message,
+        )
       ) {
         onAuthError();
         newSocket.disconnect();
       }
     });
 
-    // ── Presence ──────────────────────────────────────────────────────────
+    // PRESENCE_SNAPSHOT is still useful as the authoritative server-side view.
+    // It arrives right after connect and overrides any stale REST data.
     newSocket.on("PRESENCE_SNAPSHOT", (snapshot) => {
       setUsers(snapshot.map((u) => ({ ...u, lastSeen: new Date(u.lastSeen) })));
     });
@@ -163,146 +221,298 @@ export function SocketProvider({
       );
     });
 
-    // ── Messages ──────────────────────────────────────────────────────────
-    const appendMessage = (msg: DMMessage) => {
+    const appendMessage = (msg: ChatMessage) => {
       const normalized = { ...msg, createdAt: new Date(msg.createdAt) };
-
       setMessages((prev) => {
-        const channel = prev[msg.channelId] ?? [];
-        if (channel.some((m) => m._id === msg._id)) return prev;
-        return { ...prev, [msg.channelId]: [...channel, normalized] };
+        const roomMessages = prev[msg.roomId] ?? [];
+        if (roomMessages.some((m) => m._id === msg._id)) return prev;
+        return { ...prev, [msg.roomId]: [...roomMessages, normalized] };
       });
 
-      // Increment unread only when:
-      // 1. Message is from someone else (not our own send echo)
-      // 2. This channel is not currently open
       const isIncoming = msg.senderId !== currentUsername;
-      const isActiveChannel = activeChannelRef.current === msg.channelId;
+      const isActiveRoom = activeRoomRef.current === msg.roomId;
 
-      if (isIncoming && !isActiveChannel) {
+      if (isIncoming && !isActiveRoom) {
         setUnreadCounts((prev) => ({
           ...prev,
-          [msg.channelId]: (prev[msg.channelId] ?? 0) + 1,
+          [msg.roomId]: (prev[msg.roomId] ?? 0) + 1,
         }));
       }
     };
 
-    newSocket.on("DM_RECEIVED", appendMessage);
+    newSocket.on("MESSAGE_RECEIVED", appendMessage);
 
-    newSocket.on("DM_HISTORY", (history) => {
+    newSocket.on("MESSAGE_HISTORY", (history) => {
       if (history.length === 0) return;
-      const channelId = history[0]!.channelId;
+      const roomId = history[0]!.roomId;
       setMessages((prev) => ({
         ...prev,
-        [channelId]: history.map((m) => ({
+        [roomId]: history.map((m) => ({
           ...m,
           createdAt: new Date(m.createdAt),
         })),
       }));
-      // History fetch means this chat was just opened — clear its badge
       setUnreadCounts((prev) => {
-        if (!prev[channelId]) return prev;
-        const next = { ...prev };
-        next[channelId] = 0;
-        return next;
+        if (!prev[roomId]) return prev;
+        return { ...prev, [roomId]: 0 };
       });
     });
 
-    newSocket.on("ERROR", ({ message }) => {
-      console.error("[Socket error]", message);
-    });
+    newSocket.on("ERROR", ({ message }) =>
+      console.error("[Socket error]", message),
+    );
 
-    // ── Typing ────────────────────────────────────────────────────────────
-    newSocket.on("USER_TYPING", ({ channelId, username, isTyping }) => {
+    newSocket.on("USER_TYPING", ({ roomId, username, isTyping }) => {
       setTypingUsers((prev) => {
-        const activeTypers = prev[channelId] ?? [];
+        const activeTypers = prev[roomId] ?? [];
         if (isTyping) {
           if (activeTypers.includes(username)) return prev;
-          return { ...prev, [channelId]: [...activeTypers, username] };
+          return { ...prev, [roomId]: [...activeTypers, username] };
         } else {
           return {
             ...prev,
-            [channelId]: activeTypers.filter((u) => u !== username),
+            [roomId]: activeTypers.filter((u) => u !== username),
           };
         }
       });
     });
 
+    newSocket.on("NOTIFY_ROOM_CREATED", (room) => {
+      setRooms((prev) => {
+        if (prev.find((r) => r._id === room._id)) return prev;
+        return [room, ...prev];
+      });
+    });
+
+    newSocket.on("NOTIFY_ROOM_UPDATED", (updatedRoom) => {
+      setRooms((prev) =>
+        prev.map((r) => (r._id === updatedRoom._id ? updatedRoom : r)),
+      );
+    });
+
+    // When the recipient reads messages, update readBy in local state so
+    // the sender sees "Seen" instantly without needing a refresh or re-fetch.
+    newSocket.on("MESSAGES_READ", ({ roomId, reader }) => {
+      setMessages((prev) => {
+        const roomMessages = prev[roomId];
+        if (!roomMessages) return prev;
+        return {
+          ...prev,
+          [roomId]: roomMessages.map((msg) =>
+            msg.readBy.includes(reader)
+              ? msg
+              : { ...msg, readBy: [...msg.readBy, reader] },
+          ),
+        };
+      });
+    });
+
     return () => {
       newSocket.disconnect();
-      if (socketRef.current === newSocket) {
-        socketRef.current = null;
-      }
+      if (socketRef.current === newSocket) socketRef.current = null;
       setIsConnected(false);
     };
-  }, [token, currentUsername, onAuthError]);
+  }, [token, currentUsername, onAuthError, fetchRooms, fetchUsers]);
 
-  // ─── Actions ──────────────────────────────────────────────────────────────
-
-  const sendDM = useCallback((recipientId: string, content: string) => {
-    socketRef.current?.emit("SEND_DM", { recipientId, content });
+  const sendMessage = useCallback((roomId: string, content: string) => {
+    socketRef.current?.emit("SEND_MESSAGE", { roomId, content });
   }, []);
 
-  const fetchHistory = useCallback((targetUsername: string) => {
-    socketRef.current?.emit("FETCH_HISTORY", { targetUsername, limit: 50 });
+  const fetchHistory = useCallback((roomId: string) => {
+    socketRef.current?.emit("FETCH_HISTORY", { roomId, limit: 50 });
   }, []);
 
-  const markRead = useCallback((channelId: string) => {
-    socketRef.current?.emit("MARK_READ", { channelId });
+  const markRead = useCallback((roomId: string) => {
+    socketRef.current?.emit("MARK_READ", { roomId });
   }, []);
 
-  const sendTypingStatus = useCallback(
-    (recipientId: string, isTyping: boolean) => {
-      socketRef.current?.emit("TYPING_STATUS", { recipientId, isTyping });
-    },
-    [],
-  );
-
-  // Tell the context which channel is open so DM_RECEIVED skips the unread increment
-  const setActiveChannel = useCallback((channelId: string | null) => {
-    activeChannelRef.current = channelId;
+  const sendTypingStatus = useCallback((roomId: string, isTyping: boolean) => {
+    socketRef.current?.emit("TYPING_STATUS", { roomId, isTyping });
   }, []);
 
-  // Zero out the badge and notify the server that messages were read
+  const setActiveRoom = useCallback((roomId: string | null) => {
+    activeRoomRef.current = roomId;
+  }, []);
+
   const clearUnread = useCallback(
-    (channelId: string) => {
+    (roomId: string) => {
       setUnreadCounts((prev) => {
-        if (!prev[channelId]) return prev;
-        const next = { ...prev };
-        next[channelId] = 0;
-        return next;
+        if (!prev[roomId]) return prev;
+        return { ...prev, [roomId]: 0 };
       });
-      markRead(channelId);
+      markRead(roomId);
     },
     [markRead],
+  );
+
+  const createDMRoom = useCallback(
+    async (recipientId: string): Promise<Room | null> => {
+      if (!token) return null;
+      try {
+        const res = await fetch(
+          `${process.env.NEXT_PUBLIC_BACKEND_URL}/api/chat/rooms`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${token}`,
+            },
+            body: JSON.stringify({ recipientId }),
+          },
+        );
+        if (res.ok) {
+          const newRoom: Room = await res.json();
+          setRooms((prev) => {
+            if (prev.find((r) => r._id === newRoom._id)) return prev;
+            return [newRoom, ...prev];
+          });
+          // Fix: emit NOTIFY_ROOM_CREATED for DMs too, so the recipient's
+          // sidebar updates in real-time without a refresh.
+          socketRef.current?.emit("NOTIFY_ROOM_CREATED", newRoom);
+          return newRoom;
+        }
+        return null;
+      } catch (err) {
+        console.error("Failed to create DM room", err);
+        return null;
+      }
+    },
+    [token],
+  );
+
+  const createGroupRoom = useCallback(
+    async (name: string, members: string[]): Promise<Room | null> => {
+      if (!token) return null;
+      try {
+        const res = await fetch(
+          `${process.env.NEXT_PUBLIC_BACKEND_URL}/api/chat/rooms/group`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${token}`,
+            },
+            body: JSON.stringify({ name, members }),
+          },
+        );
+        if (res.ok) {
+          const newRoom: Room = await res.json();
+          setRooms((prev) => {
+            if (prev.find((r) => r._id === newRoom._id)) return prev;
+            return [newRoom, ...prev];
+          });
+          socketRef.current?.emit("NOTIFY_ROOM_CREATED", newRoom);
+          return newRoom;
+        }
+        return null;
+      } catch (err) {
+        console.error("Failed to create group room", err);
+        return null;
+      }
+    },
+    [token],
+  );
+
+  const addMember = useCallback(
+    async (roomId: string, username: string): Promise<Room | null> => {
+      if (!token) return null;
+      try {
+        const res = await fetch(
+          `${process.env.NEXT_PUBLIC_BACKEND_URL}/api/chat/rooms/${roomId}/members`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${token}`,
+            },
+            body: JSON.stringify({ username }),
+          },
+        );
+        if (res.ok) {
+          const updatedRoom: Room = await res.json();
+          setRooms((prev) =>
+            prev.map((r) => (r._id === updatedRoom._id ? updatedRoom : r)),
+          );
+          socketRef.current?.emit("NOTIFY_ROOM_UPDATED", updatedRoom);
+          return updatedRoom;
+        }
+        return null;
+      } catch (err) {
+        console.error("Failed to add member", err);
+        return null;
+      }
+    },
+    [token],
+  );
+
+  const removeMember = useCallback(
+    async (roomId: string, username: string): Promise<Room | null> => {
+      if (!token) return null;
+      try {
+        const res = await fetch(
+          `${process.env.NEXT_PUBLIC_BACKEND_URL}/api/chat/rooms/${roomId}/members`,
+          {
+            method: "DELETE",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${token}`,
+            },
+            body: JSON.stringify({ username }),
+          },
+        );
+        if (res.ok) {
+          const updatedRoom: Room = await res.json();
+          setRooms((prev) =>
+            prev.map((r) => (r._id === updatedRoom._id ? updatedRoom : r)),
+          );
+          socketRef.current?.emit("NOTIFY_ROOM_UPDATED", updatedRoom);
+          return updatedRoom;
+        }
+        return null;
+      } catch (err) {
+        console.error("Failed to remove member", err);
+        return null;
+      }
+    },
+    [token],
   );
 
   const value = useMemo(
     () => ({
       isConnected,
       users,
+      rooms,
       messages,
       unreadCounts,
-      sendDM,
+      sendMessage,
       fetchHistory,
       markRead,
       clearUnread,
-      setActiveChannel,
+      setActiveRoom,
       typingUsers,
       sendTypingStatus,
+      createDMRoom,
+      createGroupRoom,
+      addMember,
+      removeMember,
     }),
     [
       isConnected,
       users,
+      rooms,
       messages,
       unreadCounts,
-      sendDM,
+      sendMessage,
       fetchHistory,
       markRead,
       clearUnread,
-      setActiveChannel,
+      setActiveRoom,
       typingUsers,
       sendTypingStatus,
+      createDMRoom,
+      createGroupRoom,
+      addMember,
+      removeMember,
     ],
   );
 
@@ -311,12 +521,8 @@ export function SocketProvider({
   );
 }
 
-// ─── Hook ─────────────────────────────────────────────────────────────────────
-
 export function useSocket(): SocketContextValue {
   const ctx = useContext(SocketContext);
-  if (!ctx) {
-    throw new Error("useSocket must be used inside <SocketProvider>");
-  }
+  if (!ctx) throw new Error("useSocket must be used inside <SocketProvider>");
   return ctx;
 }
